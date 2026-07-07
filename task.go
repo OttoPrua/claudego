@@ -68,6 +68,8 @@ type Task struct {
 	LastError string  `json:"last_error,omitempty"`
 	TurnsUsed int     `json:"turns_used,omitempty"`
 	CostUSD   float64 `json:"cost_usd,omitempty"`
+	// LastSummary 是最近一步执行输出的一行摘要，供 list 看板展示“最新进度概述”。
+	LastSummary string `json:"last_summary,omitempty"`
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }

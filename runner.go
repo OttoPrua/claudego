@@ -334,6 +334,9 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 		t.TurnsUsed += res.NumTurns
 		t.CostUSD += res.TotalCostUSD
 		t.LastError = ""
+		if s := summarizeResult(res.Result); s != "" {
+			t.LastSummary = s
+		}
 		logBlock(lg, "RESULT", res.Result)
 		logSection(lg, fmt.Sprintf("步骤完成  turns=%d cost=$%.4f duration=%.0fs", res.NumTurns, res.TotalCostUSD, float64(res.DurationMS)/1000))
 
@@ -520,6 +523,25 @@ func firstLine(s string) string {
 				return line[:300]
 			}
 			return line
+		}
+	}
+	return ""
+}
+
+// summarizeResult 取一步最终输出里第一条实质内容行，作为 list 看板“最新进度概述”的回落来源。
+// 跳过空行/代码围栏，剥掉常见 markdown 前缀，rune 安全截到 80。
+func summarizeResult(result string) string {
+	for _, ln := range strings.Split(result, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "```") {
+			continue
+		}
+		ln = strings.TrimSpace(strings.TrimLeft(ln, "#*->・•· \t"))
+		if len([]rune(ln)) >= 4 {
+			if r := []rune(ln); len(r) > 80 {
+				return string(r[:80]) + "…"
+			}
+			return ln
 		}
 	}
 	return ""

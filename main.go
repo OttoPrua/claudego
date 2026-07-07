@@ -738,6 +738,40 @@ func printReportList(label string, items []any) {
 	}
 }
 
+// progressIndex 载入进度报告并按 Key / SessionID 建索引，供 list 看板关联任务的最新进度。
+func progressIndex(root string) (byKey, bySession map[string]*ProgressEntry) {
+	byKey = map[string]*ProgressEntry{}
+	bySession = map[string]*ProgressEntry{}
+	for _, e := range loadProgressEntries(root) {
+		if e.Key != "" {
+			byKey[e.Key] = e
+		}
+		if e.SessionID != "" {
+			bySession[e.SessionID] = e
+		}
+	}
+	return byKey, bySession
+}
+
+// taskProgress 给 list 看板一行“最新进度概述”：优先该任务已回收的进度报告（按 ProgressKey /
+// SessionID 关联）的现状，没有则回落到最近一步自动捕获的摘要。
+func taskProgress(t *Task, byKey, bySession map[string]*ProgressEntry) string {
+	if t.ProgressKey != "" {
+		if e := byKey[t.ProgressKey]; e != nil {
+			return reportStatus(e.Report)
+		}
+	}
+	if t.SessionID != "" {
+		if e := bySession[t.SessionID]; e != nil {
+			return reportStatus(e.Report)
+		}
+	}
+	if t.LastSummary != "" {
+		return t.LastSummary
+	}
+	return "—"
+}
+
 func shortTime(rfc string) string {
 	if t, err := time.Parse(time.RFC3339, rfc); err == nil {
 		return t.Format("01-02 15:04")
@@ -959,8 +993,9 @@ func cmdList(args []string) error {
 	for _, t := range tasks {
 		byStatus[t.Status] = append(byStatus[t.Status], t)
 	}
+	progByKey, progBySession := progressIndex(root)
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\t状态\t类型\t优先\t步骤\t标题\t就绪/备注")
+	fmt.Fprintln(w, "ID\t状态\t类型\t优先\t步骤\t标题 / 最新进度\t就绪/备注")
 	printed := 0
 	for _, st := range []string{statusRunning, statusLimitPaused, statusQueued, statusHeld, statusFailed, statusDone, statusCanceled} {
 		group := byStatus[st]
@@ -990,7 +1025,11 @@ func cmdList(args []string) error {
 			if t.MidStep {
 				step += "*"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", t.ID, zhStatus(t.Status), t.Type, t.Priority, step, truncate(t.Title, 36), note)
+			desc := truncate(t.Title, 36)
+			if prog := taskProgress(t, progByKey, progBySession); prog != "" && prog != "—" {
+				desc = truncate(truncate(t.Title, 16)+" ▸ "+prog, 54)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", t.ID, zhStatus(t.Status), t.Type, t.Priority, step, desc, note)
 			printed++
 		}
 	}
