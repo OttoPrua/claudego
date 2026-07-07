@@ -2,6 +2,8 @@
 
 [中文](README.md) | **English**
 
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-community-ffb003?logo=discourse&logoColor=white)](https://linux.do)
+
 A local task queue and scheduler built around Claude's 5-hour usage-limit window. A single Go binary, no external dependencies.
 
 The core idea: **the orchestrator itself is pure local code and consumes zero Claude quota**; `claude -p` is invoked only when a task actually runs. When a limit is hit, the task auto-pauses and records the reset time, then reconnects to the *same* session via `--resume` once the window reopens — wringing every 5-hour window dry.

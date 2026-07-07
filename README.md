@@ -2,6 +2,8 @@
 
 **中文** | [English](README.en.md)
 
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-社区分享-ffb003?logo=discourse&logoColor=white)](https://linux.do)
+
 围绕 Claude 5 小时用量限额设计的本地任务队列与调度器。单个 Go 二进制，无外部依赖。
 
 核心思路：**编排器本身是纯本地代码，不消耗任何 Claude 额度**；只有任务真正执行时才调用 `claude -p`。撞到限额时任务自动暂停并记下重置时间，到点后用 `--resume` 接回同一个会话继续干活，把每个 5 小时窗口榨干。
