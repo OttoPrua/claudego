@@ -1,0 +1,226 @@
+# ClaudeGo
+
+[中文](README.md) | **English**
+
+A local task queue and scheduler built around Claude's 5-hour usage-limit window. A single Go binary, no external dependencies.
+
+The core idea: **the orchestrator itself is pure local code and consumes zero Claude quota**; `claude -p` is invoked only when a task actually runs. When a limit is hit, the task auto-pauses and records the reset time, then reconnects to the *same* session via `--resume` once the window reopens — wringing every 5-hour window dry.
+
+```
+                 ┌──────────────────────────────────────────────┐
+   claudego add  │  Task queue  (~/.claudego/tasks)             │
+   assemble ────▶│  queued ──▶ running ──▶ done                 │
+   review  plan  │              │  └──▶ failed (after backoff)  │
+   adopt  brief  │              ▼                               │
+                 │        limit_paused ──(reset reached)──┐     │
+                 └────────────────────────────────────────┼─────┘
+                                                          │
+   launchd / daemon ticks every 5 min ──▶ pick a task ────┘
+                                              │
+                                              ▼
+                  claude -p --model <model> --resume <session> ...
+```
+
+## The five task types
+
+| Type | Purpose | Default permissions / model |
+|---|---|---|
+| `design-review` | Design-review session: read-only review of code/architecture, producing P0/P1/P2 graded findings | Read-only tools + git log/diff |
+| `prompt-assembly` | Prompt-assembly session: researches the project, then decomposes a goal into a prompt sequence — **the tasks it produces auto-enqueue** | Read-only tools |
+| `sequence` | Preset prompt sequence: several steps run in order within the same session (chained via `--resume` for continuous context) | acceptEdits + common build/test commands |
+| `coordinate` | Coordination session: reads a **live** queue snapshot + per-session progress reports and splits a goal into division-of-labor tasks (with model suggestions) that auto-enqueue | Read-only tools, defaults to opus |
+| `progress-pull` | Progress-pull session: `--resume` a session and have it emit a structured progress report to disk | Read-only tools, defaults to haiku |
+
+Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs to completion → `review_after` auto-enqueues a `design-review` of the changes just made.
+
+## Progress pull → coordinate → auto-advance
+
+The orchestration loop when several sessions work in parallel:
+
+**The desktop app is in scope too**: Claude Code's desktop app and the CLI share the `~/.claude/projects` session store and the same subscription quota, so sessions opened in the desktop app can equally be listed, pulled for progress, and taken over with `--resume`.
+
+```bash
+# 0) Find sessions: list a project's recent claude sessions (desktop + CLI share one pool) and grab a session ID
+claudego sessions -dir ~/Projects/myapp
+
+# 1) Pull progress. Interactive sessions (incl. desktop): prints a "summarize progress" prompt; paste it in and the report is written back to ~/.claudego/progress/
+claudego brief -dir ~/Projects/myapp -title auth-refactor
+#    With a session ID (queue tasks / desktop sessions from `sessions`): enqueue a haiku pull task, fully automatic
+claudego brief -id t0705-xxxx -auto
+claudego brief -session <session-id> -dir ~/Projects/myapp -auto
+
+# 2) Divide the work. A coordinate task injects a live queue snapshot + all progress reports at dispatch time,
+#    producing: a plain-English division of labor (what each task does / suggested model / manual-takeover command, kept in the log)
+#    + the split tasks auto-enqueued (with a model field; dependents get higher priority; resumable ones carry a session_id)
+claudego plan -dir ~/Projects/myapp "finish the upload module this week and fill in the tests"
+
+# 3) Auto-advance: launchd/daemon ticks as usual and runs tasks one by one per the model suggestions; inspect and take over anytime
+claudego list                       # see how far the split has progressed (title column shows "title ▸ latest progress")
+claudego log <coordinate-task-id>   # read the plain-English division of labor
+claudego cmd <id>                   # to take over a task by hand: prints the claude command + current-step prompt (hold it first)
+claudego progress                   # progress overview (a "status" column shows where each stands); -show <KEY> for a human-readable render; -in to paste-import
+```
+
+**The board doubles as progress**: `claudego list`'s title column shows each task's "title ▸ latest progress" (preferring the status from a pulled progress report, otherwise falling back to an auto-captured summary of the last step's output); `claudego progress` has a dedicated "status" column, and `progress -show <KEY>` is a human-readable render (goal / in-progress / done / remaining / blockers / key files, with the multi-thousand-word handoff prompt folded by default, `-full` to expand) — so you read *where things stand*, not a static title.
+
+**Model routing**: a task carrying a `model` field runs with `--model` (subscription limits are weighted per model, so routing routine work to sonnet/haiku noticeably stretches the 5-hour window). Every add-style command accepts `-model`; a coordinate task's division output auto-suggests a model per task along "mechanical → haiku / routine implementation → sonnet / high-risk → strongest default", and you can set defaults in `type_defaults.*.model`. Leverage inversion: expensive models do only the small-token orchestration and arbitration (coordinate defaults to `opus`); cheap models burn the large-token execution.
+
+**Design-phase profile (fable designs, codex/opus builds)**: when design quality is the top priority, switch the design trio to the strongest model — set `coordinate` / `design-review` / `prompt-assembly`'s model to `"claude-fable-5"` in `type_defaults`. The coordinate template then assigns a model to each emitted task along "design → `claude-fable-5`, implementation → prefer `runner:"codex"` (GPT-5.5, high-reasoning, its own independent quota, `model` left empty), mechanical → `sonnet`, trivial → `haiku`", reserving `opus` only for cards that genuinely need the Claude ecosystem (sub-agents, MCP tools, or resuming a Claude session). `model_weights` already ships `claude-fable-5` and `fable` at weight 10 by default. Once you enter heavy development, you can dial `design-review` back to `opus` to control spend.
+
+**In-session sub-layering (sub-agents)**: `sequence` tasks whitelist the Task tool by default, so paired with user-level sub-agents (`~/.claude/agents/deep-reasoner.md` bound to opus, `fast-worker.md` bound to sonnet) an executing session can hand hard reasoning up and push mechanical labor down — routing by task across sessions and by stage within a session, two layers stacked.
+
+### File-based state (`fresh_steps`) and human gating (`-hold`)
+
+Keeping project state in **files** (state.md / TASKS.md, etc.) is recommended so tasks don't depend on session memory:
+
+- `add -fresh`, or `"fresh_steps": true` in the emit JSON: steps don't `--resume` — each step is a brand-new session. The coordinate template bakes in a three-part contract: on start read the state file → make exactly one increment → on finish update the state file and task list.
+- Benefits: you never hit the session-context ceiling ("Prompt is too long" failures vanish), a limit interruption simply re-sends the current step in a fresh session (no resume prompt needed), the codex backup executor can take over **any** step (no longer limited to single-step tasks), and it's audit-friendly (all state changes live in git).
+- `plan -hold` / `assemble -hold`: the split tasks are parked (held) first; after a human review, `claudego release <id>` lets them proceed — the full loop of "split → gate → advance → review → update state".
+
+### Taking over existing role sessions (the review/assembly/execute sessions you maintained by hand)
+
+When a project folder already hosts a batch of long-lived role sessions, split them by role:
+
+```bash
+claudego sessions -dir ~/Projects/myapp        # Claim them: identify each role session by its first message, grab the ID
+
+# Ones with work in flight (execute/refine sessions) → pull progress first, then decide to resume or restart
+claudego brief -session <ID> -auto             # distill the existing context into a progress report (with next_prompt)
+claudego adopt <ID> -dir ~/Projects/myapp      # take over and resume the unfinished ones directly
+
+# The role sessions themselves → the matching type command + -session to mount, continuing on the old session's accumulation
+claudego review   -session <old-review-session-id> "review this week's changes"
+claudego assemble -session <old-assembly-session-id> "next goal"
+claudego add -type sequence -session <old-execute-session-id> -file next-steps.md
+
+# Or skip mounting: fold the role requirements distilled in the old session into templates/*.md, then start fresh each round (cheaper context)
+```
+
+Note: resuming an existing session in headless mode is a **fork** (a new session id is spun off; the original desktop session is untouched). After a task's first round, later rounds should mount the task's latest `session_id` (visible in `claudego list -json`), or just append steps to the same task. Long-lived session context grows ever more expensive, so the general advice is: sediment knowledge into templates/progress reports, and run execution in short sessions.
+
+## Dispatch rules (tunable in config.json)
+
+1. **Resume first** (`resume_first`): tasks interrupted by a limit run before new ones — finish the unfinished first;
+2. **Higher priority wins**;
+3. **Type order** (`type_order`): default `progress-pull > coordinate > review > sequence > assembly` (review is cheap and returns feedback fast; assembly spawns new work so it goes last);
+4. FIFO within the same tier.
+
+Limits are global: whenever any task hits a limit, a global cooldown is written (`cooldown.json`); during it no task is dispatched and no probe calls are wasted. The cooldown time prefers the reset timestamp in the error message; if none can be parsed it falls back to retrying after `limit_fallback_min` minutes.
+
+## Quick start
+
+```bash
+make build && make install     # compile and install to /opt/homebrew/bin
+claudego init                  # initialize ~/.claudego (override the data dir with CLAUDEGO_ROOT)
+
+# 1) Preset prompt sequence: split steps in steps.md with a lone --- line
+claudego add -title "refactor auth" -dir ~/Projects/myapp -priority 5 -review-after -file steps.md
+
+# 2) Prompt assembly: have Claude research first, then auto-generate a task sequence and enqueue it
+claudego assemble -dir ~/Projects/myapp "add resumable uploads to the upload module, with tests"
+
+# 3) Design review: read-only review
+claudego review -dir ~/Projects/myapp "concurrency and error handling"
+
+# 4) Take over an interactive session just interrupted by a limit (desktop or CLI; find the session id with claudego sessions)
+claudego adopt <session-id> -dir ~/Projects/myapp
+
+claudego run                   # run one round manually to verify
+claudego install-launchd       # install background scheduling: ticks every 5 min, starts at login
+claudego list                  # board; log <id> for detail; doctor for a self-check
+```
+
+If you'd rather not install launchd, just run `claudego daemon` as a foreground resident.
+
+**Cross-platform**: the core is pure Go and builds/runs on macOS, Linux, and Windows (`go build` yields a per-platform binary). `install-launchd` (login autostart + a tick every 5 min) only wires up macOS's launchd; on other platforms run `claudego daemon` as a foreground resident, or have the OS scheduler run `claudego run` every 5 minutes — systemd timers / cron on Linux, **Task Scheduler on Windows**. The single-instance lock is cross-platform (Windows uses `OpenProcess` for liveness), so scheduled runs won't collide.
+
+## 5-hour quota redline (reserve headroom)
+
+To leave headroom for bursty/interactive work: when the redline is active the queue stops dispatching (multi-step tasks also yield between steps), and `-force` crosses it. Two independent channels, inspectable anytime with `claudego quota`:
+
+```jsonc
+// ~/.claudego/config.json
+"queue_budget_tokens": 2000000,  // ① local ledger: max weighted tokens the queue may spend in the sliding 5h window; 0 disables
+"redline_percent": 85,           // ② external global usage feed: stop when the 5h-window usedPercent hits the line; 0 disables
+"usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
+"usage_feed_max_age_min": 90,    //    a stale sample is treated as unavailable → dispatch allowed (fail-open)
+"model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // per-model weighting for the ledger
+```
+
+- ① counts **only claudego's own calls** (desktop consumption is invisible to it); its semantics are a "queue budget ceiling" — your reserve = total quota − queue budget. Run `claudego quota` for a few days to see typical consumption before setting a value.
+- ② is the global view; its sample format is compatible with CodexBar's usage-history.jsonl (enable the Claude-usage probe in CodexBar). Any tool that appends one JSONL line in the same format works too.
+- Genuine exhaustion still has the limit cooldown as a backstop (parse the reset time, resume when it arrives); the redline only yields *early*.
+
+**Time-windowed redline** (`redline_windows`): inside a window, non-zero fields override the global thresholds; outside it they revert; cross midnight with `from > to`. `redline_lead_min` adds a pre-window buffer: for N minutes before a window, no new claude task is launched — a single-step task can't yield once started, so without the buffer a long task that starts right on the line burns into the reserved window (codex-pinned tasks are unaffected). Align a window's `from` with the quota window's real reset moment. A typical use — leave 25% headroom for interaction during the morning trading session, use the queue to the full the rest of the day:
+
+```jsonc
+"queue_budget_tokens": 0, "redline_percent": 0,   // global: unlimited
+"redline_windows": [
+  {"from": "06:50", "to": "11:50", "redline_percent": 75, "queue_budget_tokens": 300000}
+]
+```
+
+## Codex backup executor (no downtime during limit gaps)
+
+The scheduler itself is pure Go and spends no quota — a limit only makes tasks wait, it never takes the system down. But during a cooldown there's no execution capacity. Once you configure the codex CLI, whenever claude is blocked by cooldown or the redline, **single-step tasks with no existing claude session** (coordinate / review / assembly / single-step add — exactly the orchestration links that keep the pipeline moving) are automatically switched to run on `codex exec`:
+
+```jsonc
+"codex_bin": "/opt/homebrew/bin/codex",
+"codex_fallback": true,
+"codex_model": ""        // optional, passed through as -m
+```
+
+- Multi-step tasks that carry a claude session don't switch (context can't continue across CLIs); they resume automatically once the window resets;
+- Codex runs on its own quota: not recorded in the claude ledger, its errors don't write the global cooldown, and its successes don't clear it;
+- Sandboxing narrows by type: read-only tasks run `--sandbox read-only`, `sequence` uses `workspace-write`;
+- The board and logs label `[codex]` / `runner=codex`, and the emit/progress-parsing pipeline works as usual (coordinate can keep enqueuing splits even during a cooldown);
+- Reasoning effort is tunable via `codex_reasoning` (minimal/low/medium/high/xhigh), passed as `-c model_reasoning_effort=…`.
+
+## Limit interruption and auto-recovery details
+
+- Hitting a limit mid-step: the task is marked `limit_paused` and records `mid_step`. On resume it doesn't replay the original prompt — it sends a resume prompt (config.json's `resume_prompt`) into the **same session** so Claude continues from where it stopped, avoiding duplicate work.
+- Every step is written to disk the moment it succeeds (the task file is written atomically), so no progress is lost even if the process is killed.
+- A single-instance lock (`.lock`) keeps launchd's repeated triggers from running tasks concurrently; the lock is cleared automatically if the holding process dies.
+- Other errors (network, timeout, etc.) back off and retry per `retry_backoff_min`; past `max_attempts_per_step` the task is marked failed, and `claudego retry <id>` re-enqueues it with session and progress intact.
+
+## Permissions and safety
+
+By default tasks do **not** use `--dangerously-skip-permissions`:
+
+- Review/assembly tasks use a read-only tool whitelist;
+- `sequence` defaults to `acceptEdits` + a whitelist of common build/test commands; Bash commands outside the whitelist are auto-denied in headless mode (Claude works around them or explains).
+
+For full autonomy on a single task, add `-skip-permissions`, or set `skip_permissions` for the corresponding type in `config.json`. Tune the tool whitelist per type in `type_defaults.*.allowed_tools`.
+
+## Config quick reference (~/.claudego/config.json)
+
+| Key | Default | Description |
+|---|---|---|
+| `poll_interval_sec` | 300 | launchd/daemon polling interval |
+| `limit_fallback_min` | 30 | wait when no reset time can be parsed |
+| `cooldown_margin_sec` | 90 | safety margin added on top of the reset time |
+| `step_timeout_min` | 60 | hard per-step timeout (guards against runaways) |
+| `max_attempts_per_step` | 3 | per-step retry ceiling |
+| `retry_backoff_min` | 5 | base backoff between retries on non-limit errors |
+| `resume_first` | true | interrupted tasks resume before new ones start |
+| `type_order` | progress-pull > coordinate > review > sequence > assembly | type order at equal priority |
+| `resume_prompt` | … | resume prompt sent after a limit interruption |
+| `type_defaults.*.model` | coordinate opus; progress-pull haiku | default model per type (--model value); empty uses the account default |
+| `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
+| `thinking_tokens` | 0 | when >0, sets MAX_THINKING_TOKENS on Claude calls (larger thinking budget for design work) |
+| `queue_budget_tokens` etc. | 0 (off) | 5-hour quota redline — see the dedicated section |
+| `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types like design-review / progress-pull are exempt and may run concurrently in the same repo) |
+| `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the dedicated section |
+| `codex_reasoning` | "" | optional codex reasoning effort (minimal/low/medium/high/xhigh) → `-c model_reasoning_effort=…` |
+
+Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).
+
+## Testing
+
+```bash
+make test   # run the full state machine against a mock claude: scheduling / limit pause / cooldown / resume / assembly enqueue / failure backoff / model routing / progress pull / coordination
+```
+
+## Acknowledgements
+
+Shared on the [LINUX DO](https://linux.do) community — thanks to everyone there for the feedback.

@@ -1,5 +1,7 @@
 # ClaudeGo
 
+**中文** | [English](README.en.md)
+
 围绕 Claude 5 小时用量限额设计的本地任务队列与调度器。单个 Go 二进制，无外部依赖。
 
 核心思路：**编排器本身是纯本地代码，不消耗任何 Claude 额度**；只有任务真正执行时才调用 `claude -p`。撞到限额时任务自动暂停并记下重置时间，到点后用 `--resume` 接回同一个会话继续干活，把每个 5 小时窗口榨干。
@@ -26,7 +28,7 @@
 | `design-review` | 设计审核 session：只读审查代码/架构，产出 P0/P1/P2 分级报告 | 只读工具 + git log/diff |
 | `prompt-assembly` | prompt 装配 session：调研项目后把目标拆成 prompt 序列，**产出的任务自动入队** | 只读工具 |
 | `sequence` | 预设 prompt 序列：多个步骤在同一个会话中依次执行（`--resume` 串联，上下文连续） | acceptEdits + 常用构建/测试命令 |
-| `coordinate` | 分工协调 session：读**实时**队列快照 + 各会话进度报告，把目标拆成分工任务（含模型建议）自动入队 | 只读工具，默认 sonnet |
+| `coordinate` | 分工协调 session：读**实时**队列快照 + 各会话进度报告，把目标拆成分工任务（含模型建议）自动入队 | 只读工具，默认 opus |
 | `progress-pull` | 进度回收 session：`--resume` 某个会话，让它输出结构化进度报告并落盘 | 只读工具，默认 haiku |
 
 任务可以链式衔接：`assemble`（装配）→ 产出 `sequence` 入队 → 执行完成 → `review_after` 自动入队一个 `design-review` 审查刚才的改动。
@@ -54,11 +56,13 @@ claudego brief -session <session-id> -dir ~/Projects/myapp -auto
 claudego plan -dir ~/Projects/myapp "本周把上传模块收尾并补齐测试"
 
 # 3) 自动推进：launchd/daemon 照常 tick，按模型建议逐个执行；随时查看与接管
-claudego list                 # 看分工执行到哪了
+claudego list                 # 看分工执行到哪了（标题列＝“标题 ▸ 最新进度”）
 claudego log <协调任务ID>      # 看人话分工说明
 claudego cmd <id>             # 想手动接管某任务：打印 claude 命令 + 当前步骤 prompt（先 hold）
-claudego progress             # 看已回收的进度报告；-in 可手动粘贴导入
+claudego progress             # 进度一览（“现状”列看进展）；-show <KEY> 人读渲染、-in 手动导入
 ```
+
+**看板即进度**：`claudego list` 的标题列显示每个任务的「标题 ▸ 最新进度」（优先取已回收进度报告的现状，没有则回落到最近一步输出的自动摘要）；`claudego progress` 列表带独立的「现状」列，`progress -show <KEY>` 改为人读渲染（目标/进行中/完成/剩余/阻塞/关键文件，几千字接力 prompt 默认折叠、`-full` 展开）——一眼读出进展，不再是静态标题。
 
 **模型路由**：任务带 `model` 字段则以 `--model` 执行（订阅限额按模型加权，例行工作路由到
 sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-model`，协调任务的分工输出里
@@ -68,7 +72,7 @@ sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-mode
 **设计期 profile（fable 出设计、opus 落地）**：设计质量为第一优先级的阶段，把设计三件套切到最强模型——
 `type_defaults` 里 coordinate / design-review / prompt-assembly 的 model 设为 `"claude-fable-5"`，
 协调模板会按"设计→fable、落地→opus、机械→sonnet、琐碎→haiku"给产出任务指派模型；
-`model_weights` 记得加 `"claude-fable-5": 10`。进入密集开发期后可把 design-review 回调到 opus 控制消耗。
+`model_weights` 默认已带 `"claude-fable-5": 10`（`fable` 同权重）。进入密集开发期后可把 design-review 回调到 opus 控制消耗。
 
 **会话内再分层（子 agent）**：`sequence` 任务默认放行 Task 工具，配合用户级子 agent
 （`~/.claude/agents/deep-reasoner.md` 绑 opus、`fast-worker.md` 绑 sonnet），执行会话可以把
@@ -142,6 +146,8 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 
 不想装 launchd 时可以直接 `claudego daemon` 前台常驻。
 
+**跨平台**：核心是纯 Go，macOS / Linux / Windows 都能编译运行（`go build` 出对应平台二进制）。`install-launchd`（开机自启 + 每 5 分钟自动 tick）只对接 macOS 的 launchd；其他平台用 `claudego daemon` 前台常驻，或让系统定时器每 5 分钟拉一次 `claudego run`——Linux 用 systemd timer / cron，**Windows 用任务计划程序（Task Scheduler）**。单实例锁已跨平台（Windows 走 `OpenProcess` 探活），定时并发不会撞车。
+
 ## 5 小时额度红线（保底额度）
 
 给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。两条独立通道，`claudego quota` 随时查看：
@@ -213,13 +219,17 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 | `cooldown_margin_sec` | 90 | 重置时间上再加的安全余量 |
 | `step_timeout_min` | 60 | 单步硬超时（防跑飞） |
 | `max_attempts_per_step` | 3 | 单步失败重试上限 |
+| `retry_backoff_min` | 5 | 非限额错误的重试退避基数（分钟） |
 | `resume_first` | true | 被打断任务优先续跑 |
 | `type_order` | 进度回收>协调>审核>序列>装配 | 同优先级时的类型顺序 |
 | `resume_prompt` | … | 限额中断后的续跑提示词 |
 | `type_defaults.*.model` | 协调 opus；回收 haiku | 各类型默认模型（--model 值），空用账号默认 |
+| `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
+| `thinking_tokens` | 0 | >0 时给 claude 调用设 MAX_THINKING_TOKENS（设计活加大思考预算） |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见上文专节 |
-| `max_parallel` | 1 | 单次 tick 并行任务数（同目录强制串行） |
+| `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行；design-review/progress-pull 只读类型豁免，可同仓并发） |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见上文专节 |
+| `codex_reasoning` | "" | 可选 codex 推理档（minimal/low/medium/high/xhigh）→ `-c model_reasoning_effort=…` |
 
 提示词模板在 `~/.claudego/templates/*.md`，可直接修改（`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` 会被替换；
 `coordinate.md` 里的 `{{QUEUE}}` `{{PROGRESS}}` 在**派发时**替换为实时快照）。
@@ -229,3 +239,7 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 ```bash
 make test   # mock claude 跑完整状态机：调度/限额暂停/冷却/续跑/装配入队/失败退避/模型路由/进度回收/分工协调
 ```
+
+## 致谢
+
+本项目在 [LINUX DO](https://linux.do) 社区分享，感谢社区佬友的反馈。
