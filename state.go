@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"syscall"
 	"time"
 )
 
@@ -80,11 +79,7 @@ func staleLock(path string, ttl time.Duration) bool {
 	if json.Unmarshal(data, &li) != nil || li.PID <= 0 {
 		return true
 	}
-	proc, err := os.FindProcess(li.PID)
-	if err != nil {
-		return true
-	}
-	return proc.Signal(syscall.Signal(0)) != nil
+	return !processAlive(li.PID)
 }
 
 func releaseLock(root string) { _ = os.Remove(lockPath(root)) }
