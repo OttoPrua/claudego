@@ -569,7 +569,8 @@ func cmdProgress(args []string) error {
 	title := fs.String("title", "", "进度条目标题（-in 时用）")
 	dir := fs.String("dir", "", "关联目录（-in 时用）")
 	session := fs.String("session", "", "关联会话（-in 时用）")
-	show := fs.String("show", "", "显示某条进度原文")
+	show := fs.String("show", "", "显示某条进度（人读渲染）")
+	full := fs.Bool("full", false, "-show 时展开 next_prompt 全文")
 	rm := fs.String("rm", "", "删除某条进度")
 	_ = fs.Parse(args)
 	root := resolveRoot(*rootFlag)
@@ -586,7 +587,12 @@ func cmdProgress(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Print(string(data))
+		var e ProgressEntry
+		if err := json.Unmarshal(data, &e); err != nil || e.Report == nil {
+			fmt.Print(string(data)) // 解析失败：退回原文，不丢信息
+			return nil
+		}
+		renderReport(&e, *full)
 		return nil
 	case *in:
 		var data []byte
@@ -627,10 +633,11 @@ func cmdProgress(args []string) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "KEY\t标题\t更新\t完成/剩余/阻塞\t目录")
+	fmt.Fprintln(w, "KEY\t标题\t更新\t完成/剩/阻\t现状\t项目")
 	for _, e := range entries {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			e.Key, truncate(e.Title, 24), shortTime(e.UpdatedAt), reportCounts(e.Report), e.Dir)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			e.Key, truncate(e.Title, 20), shortTime(e.UpdatedAt),
+			reportCounts(e.Report), truncate(reportStatus(e.Report), 44), filepath.Base(e.Dir))
 	}
 	w.Flush()
 	fmt.Println("\n详情: claudego progress -show <KEY>；基于进度分工: claudego plan \"目标\"")
@@ -638,6 +645,9 @@ func cmdProgress(args []string) error {
 }
 
 func reportCounts(r map[string]any) string {
+	if isRawReport(r) {
+		return "raw"
+	}
 	c := func(k string) int {
 		if v, ok := r[k].([]any); ok {
 			return len(v)
@@ -645,6 +655,87 @@ func reportCounts(r map[string]any) string {
 		return 0
 	}
 	return fmt.Sprintf("%d/%d/%d", c("done"), c("remaining"), c("blockers"))
+}
+
+func isRawReport(r map[string]any) bool {
+	f, _ := r["format"].(string)
+	return f == "raw"
+}
+
+func rptStr(v any) string { s, _ := v.(string); return s }
+func rptArr(v any) []any  { a, _ := v.([]any); return a }
+
+// oneLine 把多行/含制表符的文本压成单行，避免撑破 progress 列表的表格对齐。
+func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// reportStatus 给列表一行可读的“进展到哪了”：优先“在做什么”，其次“刚做完什么”，
+// raw 兜底报告给原文摘要——而不是让计数恒显 0/0/0 把实际内容藏起来。
+func reportStatus(r map[string]any) string {
+	if isRawReport(r) {
+		return "[raw] " + oneLine(rptStr(r["raw"]))
+	}
+	ip := strings.TrimSpace(rptStr(r["in_progress"]))
+	if ip != "" && !strings.HasPrefix(ip, "无") && !strings.EqualFold(ip, "none") && !strings.EqualFold(ip, "n/a") {
+		return "▶ " + oneLine(ip)
+	}
+	if d := rptArr(r["done"]); len(d) > 0 {
+		return "✓ " + oneLine(rptStr(d[len(d)-1]))
+	}
+	if ip != "" {
+		return oneLine(ip) // “无（…附注）”这类说明也比空好
+	}
+	if strings.TrimSpace(rptStr(r["next_prompt"])) != "" {
+		return "…待接手"
+	}
+	return "—"
+}
+
+// renderReport 人读渲染单条进度报告（progress -show）：按“目标→进行中→完成→剩余→
+// 阻塞→关键文件”排布，next_prompt 默认折叠，避免几千字接力 prompt 淹没实际进度。
+func renderReport(e *ProgressEntry, full bool) {
+	fmt.Printf("● %s  [%s]\n", e.Title, e.Key)
+	if e.Dir != "" {
+		fmt.Printf("  目录: %s\n", e.Dir)
+	}
+	if e.SessionID != "" {
+		fmt.Printf("  会话: %s\n", e.SessionID)
+	}
+	if e.UpdatedAt != "" {
+		fmt.Printf("  更新: %s\n", shortTime(e.UpdatedAt))
+	}
+	r := e.Report
+	if isRawReport(r) {
+		fmt.Println("\n[原文兜底 raw]")
+		fmt.Println(rptStr(r["raw"]))
+		return
+	}
+	if g := strings.TrimSpace(rptStr(r["goal"])); g != "" {
+		fmt.Printf("\n目标: %s\n", g)
+	}
+	if ip := strings.TrimSpace(rptStr(r["in_progress"])); ip != "" {
+		fmt.Printf("\n进行中: %s\n", ip)
+	}
+	printReportList("已完成", rptArr(r["done"]))
+	printReportList("剩余", rptArr(r["remaining"]))
+	printReportList("阻塞", rptArr(r["blockers"]))
+	printReportList("关键文件", rptArr(r["key_files"]))
+	if np := strings.TrimSpace(rptStr(r["next_prompt"])); np != "" {
+		if full {
+			fmt.Printf("\n接力 prompt:\n%s\n", np)
+		} else {
+			fmt.Printf("\n接力 prompt: (%d 字，加 -full 展开)\n", len([]rune(np)))
+		}
+	}
+}
+
+func printReportList(label string, items []any) {
+	if len(items) == 0 {
+		return
+	}
+	fmt.Printf("\n%s (%d):\n", label, len(items))
+	for _, it := range items {
+		fmt.Printf("  • %s\n", rptStr(it))
+	}
 }
 
 func shortTime(rfc string) string {
