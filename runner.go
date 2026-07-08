@@ -38,7 +38,7 @@ var (
 	//   "Claude AI usage limit reached|1751600000"（headless 常见，带重置的 unix 时间戳）
 	//   "You've reached your usage limit ... resets at 3pm"
 	//   "5-hour limit reached"
-	limitRe     = regexp.MustCompile(`(?i)usage limit|limit reached|out of extra usage|hit your limit|limit will reset`)
+	limitRe     = regexp.MustCompile(`(?i)usage limit|limit reached|out of extra usage|hit your limit|limit will reset|out of usage credits|out of credits|/usage-credits`)
 	epochRe     = regexp.MustCompile(`\|\s*(\d{9,11})`)
 	resetTimeRe = regexp.MustCompile(`(?i)reset[s]?\s*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
 	transientRe = regexp.MustCompile(`(?i)rate.?limit|overloaded|internal server error|api error 5\d\d|econnre|network error|timed? ?out`)

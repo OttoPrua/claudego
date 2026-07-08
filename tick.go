@@ -144,13 +144,20 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 			}
 			return nil
 		}
-		msg := <-ch
-		delete(activeIDs, msg.t.ID)
-		if claimedDir[msg.t.ID] {
-			delete(activeDirs, msg.t.Dir)
-			delete(claimedDir, msg.t.ID)
+		// 等一个任务完成；或定时超时后回到循环顶重扫队列——让 drain 期间新入队的任务
+		// （尤其分离执行器，如远端主机的并行设计循环）能及时补进空闲槽位，
+		// 而不必干等某个在跑的长任务结束（否则 Mac 与 5090 的并行设计线会被串行化）。
+		select {
+		case msg := <-ch:
+			delete(activeIDs, msg.t.ID)
+			if claimedDir[msg.t.ID] {
+				delete(activeDirs, msg.t.Dir)
+				delete(claimedDir, msg.t.ID)
+			}
+			report(msg.t)
+		case <-time.After(15 * time.Second):
+			// 重扫超时：不动任何在跑任务，回循环顶用空闲槽位尝试派发新就绪任务。
 		}
-		report(msg.t)
 	}
 }
 
