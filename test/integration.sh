@@ -410,6 +410,24 @@ assert "远端任务完成且 runner=remote:rhost" "one(title='r-remote')['statu
 grep -q "remote work step" "$MOCK_DIR/ssh-calls.log" && echo "  ✔ prompt 经 ssh stdin 灌入远端" && pass=$((pass+1)) || { echo "  ✖ prompt 未经 stdin 灌入"; fail=$((fail+1)); }
 assert "结果取 marker 之后内容（Windows codex 非零退出不算失败）" "'remote step done' in (one(title='r-remote').get('last_summary') or '')"
 
+echo "== 场景25: 远端 claude/fable（带 model 走远端 claude；输出 JSON 直接 parse）=="
+echo "claude-ok" > "$MOCK_DIR/ssh-behavior"
+: > "$MOCK_DIR/ssh-calls.log"
+"$BIN" add -dir "D:/Trading-docs" -host rhost -model claude-fable-5 -fresh -title r-fable -priority 8 "remote fable design step" >/dev/null
+"$BIN" run -quiet
+assert "远端 fable 任务完成且 runner=remote:rhost" "one(title='r-fable')['status']=='done' and one(title='r-fable')['runner']=='remote:rhost'"
+grep -q -- "--model claude-fable-5" "$MOCK_DIR/ssh-calls.log" && echo "  ✔ 远端 claude 传了 --model claude-fable-5" && pass=$((pass+1)) || { echo "  ✖ 未传 --model"; fail=$((fail+1)); }
+assert "远端 claude 结果走 parseClaudeJSON（非 marker 路径）" "one(title='r-fable').get('last_summary')=='remote design done'"
+
+echo "== 场景26: 远端账号限额→按 resume_at 挂起（无损接力，不写全局冷却）=="
+echo "claude-limit" > "$MOCK_DIR/ssh-behavior"
+rm -f "$CLAUDEGO_ROOT/cooldown.json"
+"$BIN" add -dir "D:/Trading-docs" -host rhost -model claude-fable-5 -fresh -title r-limit -priority 9 "remote step hits limit" >/dev/null
+"$BIN" run -quiet
+assert "远端限额任务挂起 limit_paused 且 resume_at 在未来" "one(title='r-limit')['status']=='limit_paused' and one(title='r-limit')['resume_at_epoch']>now"
+test ! -f "$CLAUDEGO_ROOT/cooldown.json" && echo "  ✔ 未写全局冷却（远端账号与本机独立）" && pass=$((pass+1)) || { echo "  ✖ 误写了全局冷却"; fail=$((fail+1)); }
+echo "codex" > "$MOCK_DIR/ssh-behavior"
+
 echo
 echo "结果: $pass 通过, $fail 失败"
 [ "$fail" -eq 0 ]

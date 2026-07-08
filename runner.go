@@ -130,6 +130,60 @@ func invokeCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, er
 	return res, combined, runErr
 }
 
+// invokeRemoteClaude 通过 SSH 在远程主机上跑 claude -p（远程 fable 设计等，用该主机自己的 claude 账号）。
+// prompt 走 ssh stdin；claude -p --output-format json 直接把结果 JSON 打到 stdout（无需 marker/文件，复用 parseClaudeJSON）。
+// claude -p 无 -C 参数，故先 cd 到工作目录（cmd 用 cd /d + 反斜杠，posix 用 cd + 正斜杠）。
+func invokeRemoteClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+	rh, ok := cfg.RemoteHosts[t.RemoteHost]
+	if !ok {
+		return &claudeResult{Type: "result", IsError: true, Subtype: "remote_config"}, "",
+			fmt.Errorf("未配置远程主机 %q（config.remote_hosts）", t.RemoteHost)
+	}
+	sshBin := cfg.SSHBin
+	if sshBin == "" {
+		sshBin = "ssh"
+	}
+	claudeBin := rh.ClaudeBin
+	if claudeBin == "" {
+		claudeBin = "claude"
+	}
+	cdCmd, dir := "cd /d", strings.ReplaceAll(t.Dir, "/", `\`)
+	if rh.Shell == "posix" {
+		cdCmd, dir = "cd", t.Dir
+	}
+	args := claudeBin + " -p --output-format json"
+	if t.Model != "" {
+		args += " --model " + t.Model
+	}
+	if t.SkipPermissions {
+		args += " --dangerously-skip-permissions"
+	} else if t.PermissionMode != "" {
+		args += " --permission-mode " + t.PermissionMode
+	}
+	if len(t.AllowedTools) > 0 {
+		args += " --allowedTools " + strings.Join(t.AllowedTools, ",")
+	}
+	remoteCmd := fmt.Sprintf(`%s "%s" && %s`, cdCmd, dir, args)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, sshBin, "-o", "BatchMode=yes", t.RemoteHost, remoteCmd)
+	cmd.Stdin = strings.NewReader(prompt)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
+	}
+	combined := stdout.String() + "\n" + stderr.String()
+	res := parseClaudeJSON(stdout.String())
+	if res == nil {
+		res = &claudeResult{Type: "result", IsError: true, Subtype: "remote_claude_error", Result: firstLine(combined)}
+	}
+	return res, combined, runErr
+}
+
 // invokeRemoteCodex 通过 SSH 在远程主机上跑 codex exec（让 5090 等机器进编排）。
 // prompt 走 ssh stdin 灌进 codex（codex exec 无 prompt 参数时读 stdin），彻底绕开 Windows cmd 引号；
 // 结果由远端 codex 写到 -o 文件，再用 marker + type/cat 回捕到 stdout，隔开 codex 的执行日志噪声。
@@ -351,8 +405,13 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 		var runErr error
 		switch {
 		case remote:
-			// 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却；错误按普通失败退避。
-			res, combined, runErr = invokeRemoteCodex(cfg, t, prompt)
+			// 远端执行：带 claude 模型(如 fable)走远端 claude；否则走远端 codex。
+			// 两者都走该远端主机自己的账号额度，不记本机 claude 账本、不写全局冷却。
+			if t.Model != "" {
+				res, combined, runErr = invokeRemoteClaude(cfg, t, prompt)
+			} else {
+				res, combined, runErr = invokeRemoteCodex(cfg, t, prompt)
+			}
 		case useCodex:
 			// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
 			res, combined, runErr = invokeCodex(cfg, t, prompt)
@@ -381,6 +440,20 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 			t.LastError = "usage limit: " + firstLine(combined)
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("命中用量限额，%s 后恢复（%s）\n%s", fmtIn(until, now), fmtClock(until), firstLine(combined)))
+			return saveTask(root, t)
+		}
+
+		// 1b) 远端撞该主机账号限额（如 5090 的 fable/GPT 账号）：按本任务 resume_at 挂起，
+		// 不写全局冷却（远端账号与本机独立）；eligible() 到刷新时刻才再派 → 无损接力自动续跑。
+		if remote && isLimitHit(res, combined) {
+			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = false
+			t.SessionID = "" // 远端无会话可续，恢复时重发本步开新会话
+			t.LastError = "远端账号限额: " + firstLine(resultText(res))
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("远端账号限额，%s 后恢复（%s）", fmtIn(until, now), fmtClock(until)))
 			return saveTask(root, t)
 		}
 

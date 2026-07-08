@@ -74,6 +74,9 @@ type Config struct {
 type RemoteHostConfig struct {
 	// CodexBin 远端 codex 可执行名/路径（默认 "codex"）。
 	CodexBin string `json:"codex_bin,omitempty"`
+	// ClaudeBin 远端 claude 可执行名/路径（默认 "claude"）；跑远程 fable 设计等 claude 模型时用。
+	// 远端 claude 走该主机自己的账号额度，与本机 claude 独立。
+	ClaudeBin string `json:"claude_bin,omitempty"`
 	// Sandbox 远端 codex 沙箱模式；Windows OS 沙箱不可用时用 "danger-full-access"
 	// （靠 prompt 护栏 + 人工审 diff 兜底，不接 live 凭证/不下单）。默认 workspace-write。
 	Sandbox string `json:"sandbox,omitempty"`
