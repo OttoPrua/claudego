@@ -160,8 +160,11 @@ func invokeRemoteClaude(cfg *Config, t *Task, prompt string) (*claudeResult, str
 	} else if t.PermissionMode != "" {
 		args += " --permission-mode " + t.PermissionMode
 	}
-	if len(t.AllowedTools) > 0 {
-		args += " --allowedTools " + strings.Join(t.AllowedTools, ",")
+	// allowedTools 清单含空格（如 "Bash(python3 -m pytest:*)"），拼进远程 shell 串必须整体加引号，
+	// 否则 cmd/posix 都会按空格劈开、碎片被 claude 当独立参数（实测炸出 unknown option '-m'）。
+	// skip-permissions 下清单本就无效，干脆不传，少一段引号地狱。
+	if len(t.AllowedTools) > 0 && !t.SkipPermissions {
+		args += ` --allowedTools "` + strings.Join(t.AllowedTools, ",") + `"`
 	}
 	remoteCmd := fmt.Sprintf(`%s "%s" && %s`, cdCmd, dir, args)
 
