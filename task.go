@@ -40,6 +40,9 @@ type Task struct {
 	// PreferRunner 为 "codex" 时任务钉在 codex 上执行（不管 claude 忙闲），
 	// 用独立的 GPT 额度跑填充类任务；要求任务满足 codexEligible（fresh 或单步无会话）。
 	PreferRunner string `json:"runner_pref,omitempty"`
+	// RemoteHost 非空时任务在该远程主机执行（SSH → 远端 codex），键入 Config.RemoteHosts。
+	// 让 5090 等机器进编排（跨机 dev，如 Trading）；要求 remoteEligible（单步/fresh、无 claude 会话）。
+	RemoteHost string `json:"remote_host,omitempty"`
 	// MidStep 表示当前步骤执行到一半被限额打断：恢复时发送续跑提示而不是重发原 prompt。
 	MidStep bool `json:"mid_step,omitempty"`
 

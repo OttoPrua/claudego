@@ -62,6 +62,28 @@ type Config struct {
 	NoFallbackModels []string `json:"no_fallback_models,omitempty"`
 	// ThinkingTokens >0 时给 claude 调用设置 MAX_THINKING_TOKENS（拉高思考预算，设计类任务受益）。
 	ThinkingTokens int `json:"thinking_tokens,omitempty"`
+
+	// ---- 远程执行器（SSH → 远端 codex，让 5090 等机器进编排）----
+	// SSHBin 默认 "ssh"（测试可指向 mock-ssh）。RemoteHosts 键 = Task.RemoteHost（ssh 别名）。
+	// 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却、不受 claude 冷却/红线阻塞。
+	SSHBin      string                      `json:"ssh_bin,omitempty"`
+	RemoteHosts map[string]RemoteHostConfig `json:"remote_hosts,omitempty"`
+}
+
+// RemoteHostConfig 描述一台远程执行主机（SSH 可达 + 已装 codex）。
+type RemoteHostConfig struct {
+	// CodexBin 远端 codex 可执行名/路径（默认 "codex"）。
+	CodexBin string `json:"codex_bin,omitempty"`
+	// Sandbox 远端 codex 沙箱模式；Windows OS 沙箱不可用时用 "danger-full-access"
+	// （靠 prompt 护栏 + 人工审 diff 兜底，不接 live 凭证/不下单）。默认 workspace-write。
+	Sandbox string `json:"sandbox,omitempty"`
+	// TmpDir 远端存放结果文件的目录（如 "D:/tmp"，用正斜杠）；空则用远端 cwd。
+	TmpDir string `json:"tmp_dir,omitempty"`
+	// Shell 远端 shell 类型："cmd"（Windows，默认）用 & 分隔 + type + 反斜杠路径；
+	// "posix" 用 ; 分隔 + cat + 正斜杠路径。
+	Shell string `json:"shell,omitempty"`
+	// Reasoning 透传 -c model_reasoning_effort（空则用 codex 默认）。
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 // RedlineWindow 是按每日本地时间生效的红线时段（"HH:MM"，跨零点用 from > to 表示）。

@@ -80,6 +80,13 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						continue
 					}
 					switch {
+					case t.RemoteHost != "":
+						// 远端 codex 执行器：SSH 到远端跑 codex，走自己的 GPT 额度，不受 claude 冷却/红线阻塞。
+						// 需 codexEligible（单步/fresh、无会话）且已配置该主机；否则不派。useCodex 保持 false，
+						// runTask 见 RemoteHost 自走 invokeRemoteCodex。
+						if _, ok := cfg.RemoteHosts[t.RemoteHost]; !ok || !codexEligible(t) {
+							continue
+						}
 					case t.PreferRunner == "codex" && cfg.CodexBin != "" && codexEligible(t):
 						viaCodex[t.ID] = true
 					case blockReason == "":

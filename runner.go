@@ -130,6 +130,84 @@ func invokeCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, er
 	return res, combined, runErr
 }
 
+// invokeRemoteCodex 通过 SSH 在远程主机上跑 codex exec（让 5090 等机器进编排）。
+// prompt 走 ssh stdin 灌进 codex（codex exec 无 prompt 参数时读 stdin），彻底绕开 Windows cmd 引号；
+// 结果由远端 codex 写到 -o 文件，再用 marker + type/cat 回捕到 stdout，隔开 codex 的执行日志噪声。
+// 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却。安全靠 prompt 护栏 + 人工审 diff。
+func invokeRemoteCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+	rh, ok := cfg.RemoteHosts[t.RemoteHost]
+	if !ok {
+		return &claudeResult{Type: "result", IsError: true, Subtype: "remote_config"}, "",
+			fmt.Errorf("未配置远程主机 %q（config.remote_hosts）", t.RemoteHost)
+	}
+	sshBin := cfg.SSHBin
+	if sshBin == "" {
+		sshBin = "ssh"
+	}
+	codexBin := rh.CodexBin
+	if codexBin == "" {
+		codexBin = "codex"
+	}
+	sandbox := rh.Sandbox
+	if sandbox == "" {
+		sandbox = "workspace-write"
+	}
+	tmp := rh.TmpDir
+	if tmp == "" {
+		tmp = "."
+	}
+	outFile := tmp + "/claudego-remote-" + t.ID + ".txt"
+
+	const marker = "===CLAUDEGO_REMOTE_RESULT==="
+	// 远端 shell 差异：cmd（Windows，默认）用 & 分隔 + type + 反斜杠路径；posix 用 ; + cat + 正斜杠。
+	sep, catCmd, printPath := "&", "type", strings.ReplaceAll(outFile, "/", `\`)
+	if rh.Shell == "posix" {
+		sep, catCmd, printPath = ";", "cat", outFile
+	}
+	// codex -C / -o 用正斜杠（codex 自会规范化写盘）；结果打印用 shell 对应的路径分隔符。
+	remoteCmd := fmt.Sprintf(`%s exec -C "%s" --sandbox %s --skip-git-repo-check --color never -o "%s"`,
+		codexBin, t.Dir, sandbox, outFile)
+	if rh.Reasoning != "" {
+		remoteCmd += " -c model_reasoning_effort=" + rh.Reasoning
+	}
+	if cfg.CodexModel != "" {
+		remoteCmd += " -m " + cfg.CodexModel
+	}
+	remoteCmd += fmt.Sprintf(` %s echo %s %s %s "%s"`, sep, marker, sep, catCmd, printPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, sshBin, "-o", "BatchMode=yes", t.RemoteHost, remoteCmd)
+	cmd.Stdin = strings.NewReader(prompt)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
+	}
+	combined := stdout.String() + "\n" + stderr.String()
+
+	// marker 之后的 stdout 即结果文件内容（LastIndex 隔开 codex exec 的执行日志噪声）。
+	result := ""
+	if idx := strings.LastIndex(stdout.String(), marker); idx >= 0 {
+		result = strings.TrimSpace(stdout.String()[idx+len(marker):])
+	}
+	res := &claudeResult{Type: "result", Result: result}
+	// 拿到 -o 结果文件内容即视为成功：Windows codex exec 常因非致命告警（model refresh 超时等）
+	// 退出非零，退出码不足为凭；成功与否由是否产出终稿 + 人工审 diff 判定。
+	if result != "" {
+		return res, combined, nil
+	}
+	res.IsError = true
+	res.Subtype = "remote_codex_error"
+	res.Result = firstLine(combined)
+	if runErr == nil {
+		runErr = fmt.Errorf("远端 codex 无结果输出（marker 后为空）")
+	}
+	return res, combined, runErr
+}
+
 // codexEligible 判断任务能否交给备用执行器：没有 claude 会话要延续即可——
 // 单步未开跑的任务，以及 fresh_steps 任务的任意一步（状态在文件里，谁来跑都一样）。
 func codexEligible(t *Task) bool {
@@ -218,9 +296,13 @@ func clampEpoch(v int64, now time.Time) int64 {
 // useCodex 为 true 时用备用执行器 codex exec（限单步任务，冷却/红线期间由 tick 决定）。
 func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 	t.Status = statusRunning
-	if useCodex {
+	remote := t.RemoteHost != ""
+	switch {
+	case remote:
+		t.Runner = "remote:" + t.RemoteHost
+	case useCodex:
 		t.Runner = "codex"
-	} else {
+	default:
 		t.Runner = "" // 清除历史执行器标签（如降级失败后的重试回到 claude）
 	}
 	t.touch()
@@ -267,10 +349,14 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 		var res *claudeResult
 		var combined string
 		var runErr error
-		if useCodex {
+		switch {
+		case remote:
+			// 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却；错误按普通失败退避。
+			res, combined, runErr = invokeRemoteCodex(cfg, t, prompt)
+		case useCodex:
 			// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
 			res, combined, runErr = invokeCodex(cfg, t, prompt)
-		} else {
+		default:
 			res, combined, runErr = invokeClaude(cfg, t, prompt)
 			if res != nil && res.SessionID != "" {
 				t.SessionID = res.SessionID
@@ -281,7 +367,7 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 		}
 
 		// 1) 限额：记录恢复时间，全局冷却，等 tick 到点自动续跑
-		if !useCodex && isLimitHit(res, combined) {
+		if !useCodex && !remote && isLimitHit(res, combined) {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			setCooldown(root, until, firstLine(combined))
 			t.Status = statusLimitPaused
@@ -320,8 +406,8 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 			return saveTask(root, t)
 		}
 
-		// 3) 成功：推进步骤（codex 成功不代表 claude 限额解除，冷却只由 claude 路径清除）
-		if !useCodex {
+		// 3) 成功：推进步骤（codex/远端成功不代表 claude 限额解除，冷却只由 claude 路径清除）
+		if !useCodex && !remote {
 			clearCooldown(root)
 		}
 		t.Attempts = 0

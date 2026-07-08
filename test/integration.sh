@@ -393,6 +393,23 @@ printf 'coord_badtype\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 assert "自造 batch 类型被回退为 sequence" "one(title='badtype-task')['type']=='sequence'"
 assert "回退后烘焙了 sequence 权限（非空工具）" "len(one(title='badtype-task').get('allowed_tools') or [])>0 and one(title='badtype-task').get('permission_mode')=='acceptEdits'"
 
+echo "== 场景24: 远端执行器（SSH → 远端 codex；prompt 走 stdin + marker 回捕；非零退出不误判）=="
+python3 - "$CLAUDEGO_ROOT/config.json" "$PWD/test/mock-ssh.sh" <<'EOF'
+import json,sys
+p,mock=sys.argv[1],sys.argv[2]
+c=json.load(open(p))
+c["ssh_bin"]=mock
+c["remote_hosts"]={"rhost":{"sandbox":"danger-full-access","tmp_dir":"/tmp","shell":"posix"}}
+json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
+EOF
+chmod +x test/mock-ssh.sh
+: > "$MOCK_DIR/ssh-calls.log"
+"$BIN" add -dir "D:/remote/work" -host rhost -title r-remote -priority 8 "remote work step" >/dev/null
+"$BIN" run -quiet
+assert "远端任务完成且 runner=remote:rhost" "one(title='r-remote')['status']=='done' and one(title='r-remote')['runner']=='remote:rhost'"
+grep -q "remote work step" "$MOCK_DIR/ssh-calls.log" && echo "  ✔ prompt 经 ssh stdin 灌入远端" && pass=$((pass+1)) || { echo "  ✖ prompt 未经 stdin 灌入"; fail=$((fail+1)); }
+assert "结果取 marker 之后内容（Windows codex 非零退出不算失败）" "'remote step done' in (one(title='r-remote').get('last_summary') or '')"
+
 echo
 echo "结果: $pass 通过, $fail 失败"
 [ "$fail" -eq 0 ]

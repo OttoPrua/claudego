@@ -193,6 +193,7 @@ func cmdAdd(args []string) error {
 	permMode := fs.String("permission-mode", "", "覆盖权限模式")
 	model := fs.String("model", "", "覆盖模型（haiku/sonnet/opus 或完整模型名）")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
+	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	_ = fs.Parse(args)
 
 	root := resolveRoot(*rootFlag)
@@ -222,9 +223,18 @@ func cmdAdd(args []string) error {
 		return fmt.Errorf("缺少 prompt：直接写在命令行，或用 -file 指定")
 	}
 
-	wd, err := resolveDir(*dir)
-	if err != nil {
-		return err
+	var wd string
+	if *host != "" {
+		// 远端任务：-dir 是远端主机上的路径（如 D:/Project/Trading），不做本地校验。
+		wd = strings.TrimSpace(*dir)
+		if wd == "" {
+			return fmt.Errorf("-host 远程任务必须显式指定 -dir（远端工作目录，如 D:/Project/Trading）")
+		}
+	} else {
+		wd, err = resolveDir(*dir)
+		if err != nil {
+			return err
+		}
 	}
 	t := newTask(root, cfg, *typ, orDefaultTitle(*title, prompts[0]), wd, prompts, *priority)
 	t.ReviewAfter = *reviewAfter
@@ -253,6 +263,15 @@ func cmdAdd(args []string) error {
 		}
 		if cfg.CodexBin == "" {
 			return fmt.Errorf("config.json 未配置 codex_bin，无法钉定 codex 执行器")
+		}
+	}
+	if *host != "" {
+		t.RemoteHost = *host
+		if !codexEligible(t) {
+			return fmt.Errorf("-host 远程任务要求单步无会话，或加 -fresh（跨机不续 claude 会话）")
+		}
+		if _, ok := cfg.RemoteHosts[*host]; !ok {
+			return fmt.Errorf("config.json 的 remote_hosts 未配置主机 %q", *host)
 		}
 	}
 	if err := saveTask(root, t); err != nil {
