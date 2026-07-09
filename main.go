@@ -175,6 +175,11 @@ var validTypes = map[string]bool{
 	typeCoordinate: true, typeProgressPull: true,
 }
 
+// validEfforts 是 claude --effort 的合法档位。
+var validEfforts = map[string]bool{
+	"low": true, "medium": true, "high": true, "xhigh": true, "max": true,
+}
+
 func cmdAdd(args []string) error {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	rootFlag := fs.String("root", "", "数据目录")
@@ -192,6 +197,7 @@ func cmdAdd(args []string) error {
 	tools := fs.String("tools", "", "覆盖允许的工具，逗号分隔")
 	permMode := fs.String("permission-mode", "", "覆盖权限模式")
 	model := fs.String("model", "", "覆盖模型（haiku/sonnet/opus 或完整模型名）")
+	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	_ = fs.Parse(args)
@@ -254,6 +260,12 @@ func cmdAdd(args []string) error {
 	}
 	if *model != "" {
 		t.Model = *model
+	}
+	if *effort != "" {
+		if !validEfforts[*effort] {
+			return fmt.Errorf("未知 effort %q（可选: low/medium/high/xhigh/max）", *effort)
+		}
+		t.Effort = *effort
 	}
 	t.FreshSteps = *fresh
 	if *runner == "codex" {

@@ -60,4 +60,10 @@ case "$beh" in
   err)
     echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"sess-'"$n"'","num_turns":1,"total_cost_usd":0.0,"duration_ms":500}'
     ;;
+  review_concerns)
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"对抗审核报告：击破两处。\n```json\n{\"verdict\":\"concerns\",\"p0\":[\"x.mjs:10 恒真门,注入反例不报红,修法:改真实断言\"],\"p1\":[\"y.mjs:20 fail-open,修法:显式失败\"],\"p2\":[],\"summary\":\"两处承重缺陷\"}\n```","session_id":"sess-'"$n"'","num_turns":6,"total_cost_usd":0.03,"duration_ms":1600,"usage":{"input_tokens":900,"output_tokens":300,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'
+    ;;
+  review_pass)
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"对抗审核报告：全部攻不破。\n```json\n{\"verdict\":\"pass\",\"p0\":[],\"p1\":[],\"p2\":[\"小建议\"],\"summary\":\"通过\"}\n```","session_id":"sess-'"$n"'","num_turns":4,"total_cost_usd":0.02,"duration_ms":1200,"usage":{"input_tokens":700,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'
+    ;;
 esac

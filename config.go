@@ -14,6 +14,8 @@ type TypeDefaults struct {
 	SkipPermissions bool     `json:"skip_permissions,omitempty"`
 	// Model 该类型默认使用的模型（--model 值，如 haiku/sonnet），空表示账号默认模型。
 	Model string `json:"model,omitempty"`
+	// Effort 该类型默认思考等级（--effort 值：low/medium/high/xhigh/max），空表示 CLI 默认。
+	Effort string `json:"effort,omitempty"`
 }
 
 type Config struct {
@@ -65,6 +67,9 @@ type Config struct {
 	NoFallbackModels []string `json:"no_fallback_models,omitempty"`
 	// ThinkingTokens >0 时给 claude 调用设置 MAX_THINKING_TOKENS（拉高思考预算，设计类任务受益）。
 	ThinkingTokens int `json:"thinking_tokens,omitempty"`
+	// MaxFixRounds: "实现→对抗审核→自动修复"闭环的轮次上限，超过后不再自动派修复卡，
+	// 改挂 held 升级卡交人工/设计权威裁定（防同一叶卡在实现层无限打转）。0 用默认 3。
+	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 
 	// ---- 远程执行器（SSH → 远端 codex，让 5090 等机器进编排）----
 	// SSHBin 默认 "ssh"（测试可指向 mock-ssh）。RemoteHosts 键 = Task.RemoteHost（ssh 别名）。

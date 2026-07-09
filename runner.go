@@ -56,6 +56,9 @@ func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 	if t.Model != "" {
 		args = append(args, "--model", t.Model)
 	}
+	if t.Effort != "" {
+		args = append(args, "--effort", t.Effort)
+	}
 	if t.SkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
 	} else if t.PermissionMode != "" {
@@ -159,6 +162,9 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 	args := claudeBin + " -p --output-format json"
 	if t.Model != "" {
 		args += " --model " + t.Model
+	}
+	if t.Effort != "" {
+		args += " --effort " + t.Effort
 	}
 	if t.SkipPermissions {
 		args += " --dangerously-skip-permissions"
@@ -596,10 +602,19 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			focus := fmt.Sprintf("审查任务「%s」刚刚在该目录产生的改动（可结合 git diff/log）", t.Title)
 			prompt := renderTemplate(tpl, map[string]string{"DIR": t.Dir, "FOCUS": focus})
 			rv := newTask(root, cfg, typeReview, "审核: "+t.Title, t.Dir, []string{prompt}, t.Priority)
+			// 修复闭环谱系：审核卡记住被审卡，并继承其循环轮次与执行位置（远程卡在远程审）。
+			rv.ReviewOf = t.ID
+			rv.FixRound = t.FixRound
+			rv.RemoteHost = t.RemoteHost
 			if saveTask(root, rv) == nil {
 				logBlock(lg, "REVIEW", "已入队审核任务: "+rv.ID)
 			}
 		}
+	}
+	// 修复闭环：对抗审核完成后消费 verdict——pass 收口；concerns/block 自动派下一轮修复卡；
+	// 超轮限挂 held 升级卡交人工。这是"实现→审核→修复→再审"循环的自动闭合点。
+	if t.Type == typeReview {
+		handleReviewVerdict(root, cfg, t, res.Result, lg)
 	}
 }
 
@@ -619,6 +634,8 @@ type emitTask struct {
 	Prompt string   `json:"prompt"`
 	Role   string   `json:"role"`
 	ID     string   `json:"id"`
+	// Effort 思考等级（low/medium/high/xhigh/max），非法值忽略。
+	Effort string `json:"effort"`
 }
 
 type emitSpec struct {
@@ -715,6 +732,175 @@ func extractEmitTasks(result, dir string) ([]emitTask, error) {
 	return nil, fmt.Errorf("输出中没有合法的 tasks JSON（围栏/平衡扫描/文件救援均未命中）")
 }
 
+// reviewVerdict 是对抗审核报告末尾的机读结论（design-review 模板约定的 json 块）。
+type reviewVerdict struct {
+	Verdict string   `json:"verdict"`
+	P0      []string `json:"p0"`
+	P1      []string `json:"p1"`
+	P2      []string `json:"p2"`
+	Summary string   `json:"summary"`
+}
+
+// parseReviewVerdict 从审核输出提取 verdict json。围栏块从后往前找（模板要求结论放最后），
+// 兜底走未围栏平衡扫描（对 "verdict" 关键字回溯 '{' 试解）。解析不出返回 nil（旧格式兼容：不闭环只记日志）。
+func parseReviewVerdict(result string) *reviewVerdict {
+	try := func(raw string) *reviewVerdict {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || !strings.HasPrefix(raw, "{") {
+			return nil
+		}
+		var v reviewVerdict
+		if err := json.Unmarshal([]byte(raw), &v); err != nil {
+			return nil
+		}
+		switch v.Verdict {
+		case "pass", "concerns", "block":
+			return &v
+		}
+		return nil
+	}
+	ms := anyFencedRe.FindAllStringSubmatch(result, -1)
+	for i := len(ms) - 1; i >= 0; i-- {
+		if v := try(ms[i][1]); v != nil {
+			return v
+		}
+	}
+	for off := 0; ; {
+		k := strings.Index(result[off:], `"verdict"`)
+		if k < 0 {
+			break
+		}
+		pos := off + k
+		brace := pos
+		for attempt := 0; attempt < 32; attempt++ {
+			brace = strings.LastIndex(result[:brace], "{")
+			if brace < 0 {
+				break
+			}
+			var v reviewVerdict
+			dec := json.NewDecoder(strings.NewReader(result[brace:]))
+			if err := dec.Decode(&v); err == nil {
+				switch v.Verdict {
+				case "pass", "concerns", "block":
+					return &v
+				}
+			}
+		}
+		off = pos + len(`"verdict"`)
+	}
+	return nil
+}
+
+var fixTitleRe = regexp.MustCompile(`^修复R\d+: `)
+var fixTitleTailRe = regexp.MustCompile(` \[(?:concerns|block):\d+P0\+\d+P1\]$`)
+
+// baseFixTitle 剥掉自动修复卡标题的轮次前缀与判定尾注，得到谱系根标题（防止标题逐轮嵌套增长）。
+func baseFixTitle(title string) string {
+	title = fixTitleRe.ReplaceAllString(title, "")
+	return fixTitleTailRe.ReplaceAllString(title, "")
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "\n…（截断）"
+}
+
+// handleReviewVerdict 让"实现→对抗审核→修复"循环自动闭合：
+//   - pass → 记录收口（叶卡状态回写归实现卡自身纪律，编排器不写业务仓）；
+//   - concerns/block 且轮次未超限 → 依 fix-cycle 模板自动派下一轮修复卡（继承被审卡参数，
+//     强制按类闭合纪律，effort 缺省抬到 high——修复是最该多想的环节）；
+//   - 超轮限 → 挂 held 升级卡：大概率是规格歧义/契约冲突，继续在实现层打转是浪费，交人裁。
+func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *os.File) {
+	v := parseReviewVerdict(result)
+	if v == nil {
+		logBlock(lg, "FIXLOOP", "审核输出中未找到 verdict json（旧格式或审核未按模板收尾），闭环跳过")
+		return
+	}
+	if v.Verdict == "pass" {
+		logBlock(lg, "FIXLOOP", fmt.Sprintf("复审 PASS（第 %d 轮收口）: %s", t.FixRound, v.Summary))
+		return
+	}
+	if t.ReviewOf == "" {
+		logBlock(lg, "FIXLOOP", "verdict="+v.Verdict+" 但审核卡无 review_of 谱系（手工审核卡），闭环跳过")
+		return
+	}
+	orig, err := findTaskAnywhere(root, t.ReviewOf)
+	if err != nil {
+		logBlock(lg, "FIXLOOP", "verdict="+v.Verdict+" 但被审卡不可得: "+err.Error())
+		return
+	}
+	round := t.FixRound + 1
+	maxRounds := cfg.MaxFixRounds
+	if maxRounds <= 0 {
+		maxRounds = 3
+	}
+	base := baseFixTitle(orig.Title)
+	findings := ""
+	for i, p := range v.P0 {
+		findings += fmt.Sprintf("P0-%d: %s\n", i+1, p)
+	}
+	for i, p := range v.P1 {
+		findings += fmt.Sprintf("P1-%d: %s\n", i+1, p)
+	}
+	if findings == "" {
+		// concerns 却没给 P0/P1 条目——没有可执行清单就不盲派，交日志提醒人看报告。
+		logBlock(lg, "FIXLOOP", "verdict="+v.Verdict+" 但 p0/p1 均空，无可执行清单，闭环跳过（查看审核报告后人工处理）")
+		return
+	}
+	if round > maxRounds {
+		prompt := fmt.Sprintf(`任务「%s」的实现→对抗审核→修复循环已达 %d 轮仍未收敛（最新判定 %s）。
+这通常不是实现问题而是规格问题：请先判断叶卡/契约规格是否存在歧义或自相矛盾（对照最新审核报告的未闭合项），
+需要修订规格的部分列出修订建议并登记待裁（不擅改契约），确属实现缺陷的部分给出精确修法后再改。
+最新一轮未闭合项：
+%s
+审核摘要：%s`, base, maxRounds, v.Verdict, findings, v.Summary)
+		esc := newTask(root, cfg, typeSequence, fmt.Sprintf("[超轮限R%d·需人裁] %s", round, base), t.Dir, []string{prompt}, t.Priority)
+		esc.Status = statusHeld
+		esc.FixRound = round
+		if saveTask(root, esc) == nil {
+			logBlock(lg, "FIXLOOP", fmt.Sprintf("超轮限（R%d>上限%d），已挂 held 升级卡 %s 交人工裁定", round, maxRounds, esc.ID))
+		}
+		return
+	}
+	tpl, err := loadTemplate(root, "fix-cycle")
+	if err != nil {
+		logBlock(lg, "FIXLOOP", "fix-cycle 模板不可得: "+err.Error())
+		return
+	}
+	prompt := renderTemplate(tpl, map[string]string{
+		"TITLE":      base,
+		"VERDICT":    v.Verdict,
+		"ROUND":      fmt.Sprintf("%d", round),
+		"SUMMARY":    v.Summary,
+		"FINDINGS":   strings.TrimSpace(findings),
+		"ORIG_PROMPT": truncateRunes(strings.Join(orig.Prompts, "\n---\n"), 4000),
+		"REVIEW_LOG": filepath.Join(logsDir(root), t.ID+".log"),
+	})
+	title := fmt.Sprintf("修复R%d: %s [%s:%dP0+%dP1]", round, base, v.Verdict, len(v.P0), len(v.P1))
+	nt := newTask(root, cfg, typeSequence, title, orig.Dir, []string{prompt}, orig.Priority)
+	nt.ReviewAfter = true
+	nt.FixRound = round
+	nt.Model = orig.Model
+	nt.SkipPermissions = orig.SkipPermissions
+	nt.PermissionMode = orig.PermissionMode
+	nt.AllowedTools = append([]string(nil), orig.AllowedTools...)
+	nt.RemoteHost = orig.RemoteHost
+	// 修复是最该多想的环节：未显式指定时抬到 high（质量优先）。不继承 PreferRunner——
+	// 修复吃上下文推理，钉 codex 的填充类偏好不适用。
+	nt.Effort = orig.Effort
+	if nt.Effort == "" {
+		nt.Effort = "high"
+	}
+	if err := saveTask(root, nt); err != nil {
+		logBlock(lg, "FIXLOOP", "修复卡保存失败: "+err.Error())
+		return
+	}
+	logBlock(lg, "FIXLOOP", fmt.Sprintf("verdict=%s → 已自动入队第 %d 轮修复卡 %s（%dP0+%dP1，effort=%s）", v.Verdict, round, nt.ID, len(v.P0), len(v.P1), nt.Effort))
+}
+
 func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]string, error) {
 	tasks, err := extractEmitTasks(result, parent.Dir)
 	if err != nil {
@@ -771,6 +957,9 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		}
 		if s.Model != "" {
 			nt.Model = s.Model
+		}
+		if validEfforts[s.Effort] {
+			nt.Effort = s.Effort
 		}
 		nt.SessionID = s.SessionID
 		if parent.EmitHold {

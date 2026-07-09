@@ -499,6 +499,35 @@ else
 fi
 echo "codex" > "$MOCK_DIR/ssh-behavior"
 
+echo "== 场景29: 修复闭环——审核 concerns 自动派修复卡，修复后再审 pass 收口 =="
+# 时序: 实现卡(ok) → 自动审核(review_concerns) → 自动修复R1(ok) → 自动再审(review_pass) → 停
+printf 'ok\nreview_concerns\nok\nreview_pass\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
+"$BIN" add -dir "$PROJ" -title fixloop-impl -priority 6 -review-after -model opus "implement leaf X" >/dev/null
+"$BIN" run -quiet
+assert "实现卡完成" "one(title='fixloop-impl')['status']=='done'"
+assert "审核卡带谱系(review_of=实现卡)" "one(title='审核: fixloop-impl')['review_of']==one(title='fixloop-impl')['id']"
+assert "concerns 自动派修复R1卡且完成" "one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['status']=='done'"
+assert "修复卡继承模型并抬 effort=high" "one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['model']=='opus' and one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['effort']=='high'"
+assert "修复卡自动挂再审且 pass 后停（无修复R2）" "one(title='审核: 修复R1: fixloop-impl [concerns:1P0+1P1]')['status']=='done' and len([t for t in tasks if t['title'].startswith('修复R2')])==0"
+grep -q "按类闭合" "$MOCK_DIR/calls.log" && echo "  ✔ 修复 prompt 含按类闭合纪律" && pass=$((pass+1)) || { echo "  ✖ 修复 prompt 缺按类闭合"; fail=$((fail+1)); }
+grep -q -- "--effort high" "$MOCK_DIR/calls.log" && echo "  ✔ 修复调用传了 --effort high" && pass=$((pass+1)) || { echo "  ✖ 未传 --effort"; fail=$((fail+1)); }
+
+echo "== 场景30: 修复闭环——超轮限挂 held 升级卡不再自动修 =="
+# 手工造一张已到第 3 轮的修复卡(带 review-after),模拟循环打转到轮限
+python3 - "$CLAUDEGO_ROOT" "$PROJ" <<'PYEOF'
+import json,sys,os
+root,proj=sys.argv[1],sys.argv[2]
+tid="t9999-0000-fx03"
+task={"id":tid,"title":"修复R3: fixloop-impl2 [concerns:0P0+1P1]","type":"sequence","priority":6,
+"status":"queued","dir":proj,"prompts":["fix again"],"step":0,
+"review_after":True,"fix_round":3,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+open(os.path.join(root,"tasks",tid+".json"),"w").write(json.dumps(task,ensure_ascii=False))
+PYEOF
+printf 'ok\nreview_concerns\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
+"$BIN" run -quiet
+assert "R3 修复卡完成" "one(id='t9999-0000-fx03')['status']=='done'"
+assert "超轮限→held 升级卡而非修复R4" "len([t for t in tasks if '超轮限' in t['title'] and t['status']=='held'])==1 and len([t for t in tasks if t['title'].startswith('修复R4')])==0"
+
 echo
 echo "结果: $pass 通过, $fail 失败"
 [ "$fail" -eq 0 ]

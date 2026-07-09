@@ -48,6 +48,13 @@ type Task struct {
 
 	EmitTasks   bool `json:"emit_tasks,omitempty"`
 	ReviewAfter bool `json:"review_after,omitempty"`
+	// Effort 非空时以 --effort 传给 claude（low/medium/high/xhigh/max），按任务难度调思考等级。
+	Effort string `json:"effort,omitempty"`
+	// ReviewOf: 本卡是审核卡时指向被审卡 ID；修复闭环靠它取被审卡的 prompt/参数做继承。
+	ReviewOf string `json:"review_of,omitempty"`
+	// FixRound: "实现→对抗审核→修复"循环轮次。实现卡 0，第 n 轮自动修复卡为 n；审核卡继承被审卡轮次。
+	// 达到 config.max_fix_rounds 后不再自动派修复，改挂 held 升级卡交人工/设计权威裁定。
+	FixRound int `json:"fix_round,omitempty"`
 	// FreshSteps 表示步骤间不 --resume：每一步都是全新会话（配合"状态在文件里"的项目规约，
 	// prompt 自带读状态文件的开工动作）。永不依赖会话记忆，也就不会撞会话上下文上限。
 	FreshSteps bool `json:"fresh_steps,omitempty"`
@@ -111,8 +118,25 @@ func newTask(root string, cfg *Config, typ, title, dir string, prompts []string,
 		t.AllowedTools = append([]string(nil), td.AllowedTools...)
 		t.SkipPermissions = td.SkipPermissions
 		t.Model = td.Model
+		t.Effort = td.Effort
 	}
 	return t
+}
+
+// findTaskAnywhere 先在 tasks/ 再在 archive/ 按精确 ID 找任务
+// （修复闭环取谱系时，被审卡可能已被 clean 归档）。
+func findTaskAnywhere(root, id string) (*Task, error) {
+	for _, dir := range []string{tasksDir(root), archiveDir(root)} {
+		p := filepath.Join(dir, id+".json")
+		if data, err := os.ReadFile(p); err == nil {
+			var t Task
+			if err := json.Unmarshal(data, &t); err != nil {
+				return nil, err
+			}
+			return &t, nil
+		}
+	}
+	return nil, fmt.Errorf("任务 %s 不存在（tasks/ 与 archive/ 均无）", id)
 }
 
 func taskPath(root, id string) string { return filepath.Join(tasksDir(root), id+".json") }
