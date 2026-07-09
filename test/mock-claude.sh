@@ -1,6 +1,6 @@
 #!/bin/bash
 # 模拟 claude CLI：行为由 $MOCK_DIR/plan 控制（每行一个行为，按调用次数消费）。
-# 行为: ok | slow | emit | coord | progress | limit | limit_at:<epoch> | err
+# 行为: ok | slow | hang | emit | coord | progress | limit | limit_at:<epoch> | err
 set -u
 PROMPT=$(cat)
 mkdir -p "$MOCK_DIR"
@@ -17,6 +17,12 @@ beh=$(sed -n "${n}p" "$MOCK_DIR/plan" 2>/dev/null)
 [ -z "$beh" ] && beh=ok
 
 case "$beh" in
+  hang)
+    # 模拟吊死的执行器：派生孙进程并记录 pid，供 cancel 的进程组击杀断言。
+    sleep 300 &
+    echo $! > "$MOCK_DIR/hang-child.pid"
+    sleep 300
+    ;;
   slow)
     sleep 1.2
     echo '{"type":"result","subtype":"success","is_error":false,"result":"slow ok","session_id":"sess-'"$n"'","num_turns":3,"total_cost_usd":0.01,"duration_ms":1200,"usage":{"input_tokens":800,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'

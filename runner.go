@@ -48,7 +48,7 @@ var (
 	jsonFileRe  = regexp.MustCompile(`[\w./\\-]+\.json`)
 )
 
-func invokeClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	args := []string{"-p", "--output-format", "json"}
 	if t.SessionID != "" {
 		args = append(args, "--resume", t.SessionID)
@@ -65,9 +65,10 @@ func invokeClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, e
 		args = append(args, "--allowedTools", strings.Join(t.AllowedTools, ","))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cfg.ClaudeBin, args...)
+	setupProcGroup(cmd)
 	cmd.Dir = t.Dir
 	if cfg.ThinkingTokens > 0 {
 		cmd.Env = append(os.Environ(), fmt.Sprintf("MAX_THINKING_TOKENS=%d", cfg.ThinkingTokens))
@@ -77,7 +78,7 @@ func invokeClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, e
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	runErr := cmd.Run()
+	runErr := runCmdRegistered(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -88,7 +89,7 @@ func invokeClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, e
 
 // invokeCodex 用 codex exec 执行一步（备用执行器）。结果通过 --output-last-message 取回，
 // 包装成 claudeResult 以复用后续的 emit/进度解析管线。
-func invokeCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	sandbox := "read-only"
 	var extra []string
 	if t.Type == typeSequence {
@@ -109,14 +110,15 @@ func invokeCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, er
 	}
 	args = append(args, prompt)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cfg.CodexBin, args...)
+	setupProcGroup(cmd)
 	cmd.Dir = t.Dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := runCmdRegistered(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -136,7 +138,7 @@ func invokeCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, er
 // invokeRemoteClaude 通过 SSH 在远程主机上跑 claude -p（远程 fable 设计等，用该主机自己的 claude 账号）。
 // prompt 走 ssh stdin；claude -p --output-format json 直接把结果 JSON 打到 stdout（无需 marker/文件，复用 parseClaudeJSON）。
 // claude -p 无 -C 参数，故先 cd 到工作目录（cmd 用 cd /d + 反斜杠，posix 用 cd + 正斜杠）。
-func invokeRemoteClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	rh, ok := cfg.RemoteHosts[t.RemoteHost]
 	if !ok {
 		return &claudeResult{Type: "result", IsError: true, Subtype: "remote_config"}, "",
@@ -171,14 +173,15 @@ func invokeRemoteClaude(cfg *Config, t *Task, prompt string) (*claudeResult, str
 	}
 	remoteCmd := fmt.Sprintf(`%s "%s" && %s`, cdCmd, dir, args)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, sshBin, "-o", "BatchMode=yes", t.RemoteHost, remoteCmd)
+	setupProcGroup(cmd)
 	cmd.Stdin = strings.NewReader(prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := runCmdRegistered(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -199,7 +202,7 @@ func invokeRemoteClaude(cfg *Config, t *Task, prompt string) (*claudeResult, str
 // prompt 走 ssh stdin 灌进 codex（codex exec 无 prompt 参数时读 stdin），彻底绕开 Windows cmd 引号；
 // 结果由远端 codex 写到 -o 文件，再用 marker + type/cat 回捕到 stdout，隔开 codex 的执行日志噪声。
 // 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却。安全靠 prompt 护栏 + 人工审 diff。
-func invokeRemoteCodex(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	rh, ok := cfg.RemoteHosts[t.RemoteHost]
 	if !ok {
 		return &claudeResult{Type: "result", IsError: true, Subtype: "remote_config"}, "",
@@ -240,14 +243,15 @@ func invokeRemoteCodex(cfg *Config, t *Task, prompt string) (*claudeResult, stri
 	}
 	remoteCmd += fmt.Sprintf(` %s echo %s %s %s "%s"`, sep, marker, sep, catCmd, printPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, sshBin, "-o", "BatchMode=yes", t.RemoteHost, remoteCmd)
+	setupProcGroup(cmd)
 	cmd.Stdin = strings.NewReader(prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := runCmdRegistered(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -356,10 +360,18 @@ func clampEpoch(v int64, now time.Time) int64 {
 	return v
 }
 
-// runTask 在一次派发内循环执行任务的各个步骤，直到完成、失败或撞上限额。
+// runTask 在一次派发内循环执行任务的各个步骤，直到完成、失败、撞上限额或被取消。
 // 同一任务的多个步骤通过 --resume 复用同一会话，保持上下文连续。
 // useCodex 为 true 时用备用执行器 codex exec（限单步任务，冷却/红线期间由 tick 决定）。
-func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
+// ctx 由 tick 持有：任务被 cancel 后 tick 对账发现即取消 ctx，整组击杀执行进程。
+func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bool) error {
+	// 守门：pickNext 之后、开跑之前任务可能刚被 cancel（非运行态 cancel 直接归档移走文件），
+	// 别把已取消的任务写回 tasks/ 复活成 running。
+	if diskCanceled(root, t.ID) {
+		t.Status = statusCanceled
+		_ = archiveTask(root, t)
+		return nil
+	}
 	t.Status = statusRunning
 	remote := t.RemoteHost != ""
 	switch {
@@ -419,21 +431,30 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 			// 远端执行：带 claude 模型(如 fable)走远端 claude；否则走远端 codex。
 			// 两者都走该远端主机自己的账号额度，不记本机 claude 账本、不写全局冷却。
 			if t.Model != "" {
-				res, combined, runErr = invokeRemoteClaude(cfg, t, prompt)
+				res, combined, runErr = invokeRemoteClaude(ctx, cfg, t, prompt)
 			} else {
-				res, combined, runErr = invokeRemoteCodex(cfg, t, prompt)
+				res, combined, runErr = invokeRemoteCodex(ctx, cfg, t, prompt)
 			}
 		case useCodex:
 			// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
-			res, combined, runErr = invokeCodex(cfg, t, prompt)
+			res, combined, runErr = invokeCodex(ctx, cfg, t, prompt)
 		default:
-			res, combined, runErr = invokeClaude(cfg, t, prompt)
+			res, combined, runErr = invokeClaude(ctx, cfg, t, prompt)
 			if res != nil && res.SessionID != "" {
 				t.SessionID = res.SessionID
 			}
 			if res != nil {
 				appendUsage(root, cfg, t, res.Usage)
 			}
+		}
+
+		// 0) 取消：tick 对账发现盘上已标 canceled 后取消 ctx 击杀进程组；也可能进程
+		// 自然结束后才发现取消标记（cancel 落在步骤间隙）。两种都按取消收尾：
+		// 产物丢弃（远端"结果在手即成功"的救援同样让位），不再把内存态写回任务文件。
+		// 残余竞态窗口：cancel 恰落在本检查与本步 saveTask 之间的微秒级间隙会被盖掉，
+		// 由 tick 的周期对账兜底不了（文件已非 canceled），接受——窗口从整步时长缩到微秒。
+		if ctx.Err() != nil || diskCanceled(root, t.ID) {
+			return finalizeCanceled(root, t, lg)
 		}
 
 		// 1) 限额：记录恢复时间，全局冷却，等 tick 到点自动续跑
@@ -517,6 +538,11 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 				return err
 			}
 			postComplete(root, cfg, t, res, lg)
+			// postComplete 期间任务可能被 cancel 并归档（done 态 cancel 走立即归档），
+			// 注解回写别把归档移走的文件复活。
+			if diskCanceled(root, t.ID) {
+				return nil
+			}
 			return saveTask(root, t)
 		}
 		t.touch()
@@ -524,6 +550,18 @@ func runTask(root string, cfg *Config, t *Task, useCodex bool) error {
 			return err
 		}
 	}
+}
+
+// finalizeCanceled 按取消收尾：执行进程（组）已被击杀或已自然结束，本步产物丢弃，
+// 归档盘上的任务文件——cancel 命令对 running 任务只写取消标记不归档（进程还活着），
+// 归档由这里补上；文件已被移走（非运行态 cancel 或人工删除）则忽略。
+func finalizeCanceled(root string, t *Task, lg *os.File) error {
+	t.Status = statusCanceled
+	logBlock(lg, "CANCELED", "任务已取消：终止执行进程，丢弃本步产物并归档。")
+	if err := archiveTask(root, t); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // postComplete 处理任务链：进度报告落盘；装配/协调任务产出的新任务入队；review_after 自动入队设计审核。

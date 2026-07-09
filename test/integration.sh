@@ -1,6 +1,6 @@
 #!/bin/bash
 # 集成测试：用 mock claude 验证 调度顺序 / 限额暂停+冷却 / 自动续跑 / 装配产出入队 / 完成后自动审核
-# / 模型路由 / 进度自动回收 / 分工协调（实时快照注入 + 带模型入队）。
+# / 模型路由 / 进度自动回收 / 分工协调（实时快照注入 + 带模型入队）/ cancel 击杀在跑进程组并释放目录。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -426,6 +426,77 @@ rm -f "$CLAUDEGO_ROOT/cooldown.json"
 "$BIN" run -quiet
 assert "远端限额任务挂起 limit_paused 且 resume_at 在未来" "one(title='r-limit')['status']=='limit_paused' and one(title='r-limit')['resume_at_epoch']>now"
 test ! -f "$CLAUDEGO_ROOT/cooldown.json" && echo "  ✔ 未写全局冷却（远端账号与本机独立）" && pass=$((pass+1)) || { echo "  ✖ 误写了全局冷却"; fail=$((fail+1)); }
+echo "codex" > "$MOCK_DIR/ssh-behavior"
+
+echo "== 场景27: cancel 运行中任务 → 击杀进程组、≤1 重扫周期释放同目录槽位 =="
+python3 - "$CLAUDEGO_ROOT/config.json" <<'EOF'
+import json,sys
+p=sys.argv[1]; c=json.load(open(p)); c["drain_rescan_sec"]=1
+json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
+EOF
+printf 'hang\nok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
+rm -f "$MOCK_DIR/hang-child.pid"
+"$BIN" add -dir "$PROJ" -title cxl-victim -priority 9 "long hanging work" >/dev/null
+"$BIN" add -dir "$PROJ" -title cxl-heir -priority 2 "heir work" >/dev/null
+"$BIN" run -quiet & RUNPID=$!
+( sleep 90; kill -9 $RUNPID 2>/dev/null ) & WDPID=$!
+vid=""
+for _ in $(seq 1 50); do
+  vid=$("$BIN" list -json | python3 -c "import json,sys;ts=[t for t in (json.load(sys.stdin) or []) if t['title']=='cxl-victim' and t['status']=='running'];print(ts[0]['id'] if ts else '')")
+  [ -n "$vid" ] && break
+  sleep 0.2
+done
+[ -n "$vid" ] && echo "  ✔ 挂起任务已进入 running" && pass=$((pass+1)) || { echo "  ✖ 任务未进入 running"; fail=$((fail+1)); }
+cout=$("$BIN" cancel "$vid")
+echo "$cout" | grep -q "已标记取消" && echo "  ✔ 运行中任务 cancel 返回标记提示（暂不归档）" && pass=$((pass+1)) || { echo "  ✖ cancel 输出异常: $cout"; fail=$((fail+1)); }
+T0=$(python3 -c "import time;print(time.time())")
+if wait $RUNPID; then
+  EL=$(python3 -c "import time;print(time.time()-$T0)")
+  python3 -c "import sys;sys.exit(0 if $EL < 8 else 1)" && echo "  ✔ cancel 后 run 快速排空收工（${EL%.*}s，mock 本应吊 300s）" && pass=$((pass+1)) || { echo "  ✖ cancel 后收工过慢（${EL}s）"; fail=$((fail+1)); }
+else
+  echo "  ✖ run 未正常退出（被看门狗击杀？）"; fail=$((fail+1))
+fi
+{ kill $WDPID && wait $WDPID; } 2>/dev/null || true
+assert "同目录后继任务在 cancel 后被派发完成" "one(title='cxl-heir')['status']=='done'"
+test ! -f "$CLAUDEGO_ROOT/tasks/$vid.json" && test -f "$CLAUDEGO_ROOT/archive/$vid.json" && echo "  ✔ 被取消任务已归档（tasks/ 已清）" && pass=$((pass+1)) || { echo "  ✖ 被取消任务未归档"; fail=$((fail+1)); }
+python3 -c "import json,sys;sys.exit(0 if json.load(open('$CLAUDEGO_ROOT/archive/$vid.json'))['status']=='canceled' else 1)" \
+  && echo "  ✔ 归档状态为 canceled" && pass=$((pass+1)) || { echo "  ✖ 归档状态不是 canceled"; fail=$((fail+1)); }
+cpid=$(cat "$MOCK_DIR/hang-child.pid" 2>/dev/null || echo "")
+if [ -n "$cpid" ] && ! kill -0 "$cpid" 2>/dev/null; then
+  echo "  ✔ 进程组连坐击杀（孙进程已死）"; pass=$((pass+1))
+else
+  echo "  ✖ 孙进程仍存活或 pid 缺失（$cpid）"; fail=$((fail+1)); [ -n "$cpid" ] && kill -9 "$cpid" 2>/dev/null || true
+fi
+
+echo "== 场景28: cancel 运行中远端卡 → 击杀本地 ssh 释放槽位（远端产物丢弃）=="
+echo "claude-hang" > "$MOCK_DIR/ssh-behavior"
+rm -f "$MOCK_DIR/ssh-hang-child.pid"
+"$BIN" add -dir "D:/remote/hangwork" -host rhost -model claude-fable-5 -fresh -title r-victim -priority 8 "remote hanging step" >/dev/null
+"$BIN" run -quiet & RUNPID=$!
+( sleep 90; kill -9 $RUNPID 2>/dev/null ) & WDPID=$!
+rid=""
+for _ in $(seq 1 50); do
+  rid=$("$BIN" list -json | python3 -c "import json,sys;ts=[t for t in (json.load(sys.stdin) or []) if t['title']=='r-victim' and t['status']=='running'];print(ts[0]['id'] if ts else '')")
+  [ -n "$rid" ] && break
+  sleep 0.2
+done
+[ -n "$rid" ] && echo "  ✔ 远端卡已进入 running" && pass=$((pass+1)) || { echo "  ✖ 远端卡未进入 running"; fail=$((fail+1)); }
+"$BIN" cancel "$rid" >/dev/null
+T0=$(python3 -c "import time;print(time.time())")
+if wait $RUNPID; then
+  EL=$(python3 -c "import time;print(time.time()-$T0)")
+  python3 -c "import sys;sys.exit(0 if $EL < 8 else 1)" && echo "  ✔ cancel 后 ssh 被击杀、run 快速收工（${EL%.*}s）" && pass=$((pass+1)) || { echo "  ✖ cancel 后收工过慢（${EL}s）"; fail=$((fail+1)); }
+else
+  echo "  ✖ run 未正常退出（被看门狗击杀？）"; fail=$((fail+1))
+fi
+{ kill $WDPID && wait $WDPID; } 2>/dev/null || true
+test ! -f "$CLAUDEGO_ROOT/tasks/$rid.json" && test -f "$CLAUDEGO_ROOT/archive/$rid.json" && echo "  ✔ 远端卡已归档" && pass=$((pass+1)) || { echo "  ✖ 远端卡未归档"; fail=$((fail+1)); }
+spid=$(cat "$MOCK_DIR/ssh-hang-child.pid" 2>/dev/null || echo "")
+if [ -n "$spid" ] && ! kill -0 "$spid" 2>/dev/null; then
+  echo "  ✔ ssh 进程组已整组击杀（本地槽位与目录锁释放）"; pass=$((pass+1))
+else
+  echo "  ✖ ssh 孙进程仍存活或 pid 缺失（$spid）"; fail=$((fail+1)); [ -n "$spid" ] && kill -9 "$spid" 2>/dev/null || true
+fi
 echo "codex" > "$MOCK_DIR/ssh-behavior"
 
 echo

@@ -27,6 +27,9 @@ type Config struct {
 	// MaxParallel: 单次 tick 内最多并行跑几个任务（同一工作目录始终串行）。1 为纯串行。
 	MaxParallel int  `json:"max_parallel"`
 	ResumeFirst bool `json:"resume_first"`
+	// DrainRescanSec: drain 等待期间的重扫周期（秒）。每周期重扫队列补派新就绪任务，
+	// 并做取消对账（running 任务的文件被标 canceled 即击杀其进程）。0 用默认 15。
+	DrainRescanSec int `json:"drain_rescan_sec,omitempty"`
 	TypeOrder         []string                `json:"type_order"`
 	ResumePrompt      string                  `json:"resume_prompt"`
 	TypeDefaults      map[string]TypeDefaults `json:"type_defaults"`
@@ -116,6 +119,7 @@ func defaultConfig(claudeBin string) *Config {
 		RetryBackoffMin:   5,
 		MaxParallel:       1,
 		ResumeFirst:       true,
+		DrainRescanSec:    15,
 		TypeOrder:         []string{typeProgressPull, typeCoordinate, typeReview, typeSequence, typeAssembly},
 		QueueBudgetTokens: 0,
 		RedlinePercent:    0,

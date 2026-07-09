@@ -121,7 +121,7 @@ func printUsage() {
 任务管理
   hold/release <id>                # 挂起 / 恢复排队
   retry <id>                       # 失败任务重新入队（保留会话与进度）
-  cancel <id>                      # 取消并归档
+  cancel <id>                      # 取消并归档（运行中的任务会先终止其执行进程）
   clean                            # 把 done/failed/canceled 归档到 archive/
 
 系统
@@ -1120,10 +1120,18 @@ func cmdSetStatus(args []string, action string) error {
 			t.MidStep = false
 		}
 	case "cancel":
+		wasRunning := t.Status == statusRunning
 		t.Status = statusCanceled
 		t.touch()
 		if err := saveTask(root, t); err != nil {
 			return err
+		}
+		if wasRunning {
+			// 进程还活着，先别归档：drain 每个重扫周期对账任务文件，见 canceled 即
+			// 击杀其执行进程组、释放槽位与目录互斥，然后归档（调度进程不在场时由
+			// 下次 tick 收尾归档）。立即归档会让对账无处读状态，且进程会一直吊着。
+			fmt.Printf("%s 已标记取消，运行中的进程将在一个重扫周期内被终止并归档。\n", t.ID)
+			return nil
 		}
 		if err := archiveTask(root, t); err != nil {
 			return err

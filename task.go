@@ -152,7 +152,10 @@ func loadTasks(root string) ([]*Task, error) {
 		}
 		t, err := loadTask(root, strings.TrimSuffix(e.Name(), ".json"))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告: 跳过损坏的任务文件 %s: %v\n", e.Name(), err)
+			// ReadDir 与逐个读文件之间任务可能被并发归档移走（如 cancel 收尾），不是损坏，静默跳过。
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "警告: 跳过损坏的任务文件 %s: %v\n", e.Name(), err)
+			}
 			continue
 		}
 		tasks = append(tasks, t)
@@ -188,6 +191,17 @@ func findTask(root, prefix string) (*Task, error) {
 		}
 		return nil, fmt.Errorf("前缀 %q 匹配到多个任务: %s", prefix, strings.Join(ids, ", "))
 	}
+}
+
+// diskCanceled 判断任务在盘上是否已被取消。cancel 命令与调度进程各跑各的，
+// 只能靠任务文件表态：状态为 canceled，或文件已不在 tasks/（非运行态 cancel
+// 直接归档移走、或被人工删除）都算取消。读不出的损坏文件不算（别误杀）。
+func diskCanceled(root, id string) bool {
+	t, err := loadTask(root, id)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	return t.Status == statusCanceled
 }
 
 func archiveTask(root string, t *Task) error {

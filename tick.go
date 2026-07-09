@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -12,6 +13,7 @@ import (
 // 全部跑完或没有可派发任务时才返回。同一工作目录同一时刻只跑一个任务，
 // 避免两个会话并发改同一个仓库。launchd 每隔 poll_interval_sec 调一次兜底。
 func tick(root string, cfg *Config, force, quiet bool) error {
+	killHandlerOnce.Do(installKillHandler) // 子进程自成进程组后，Ctrl-C/SIGTERM 需接管连坐
 	if !acquireLock(root, lockTTL(cfg)) {
 		if !quiet {
 			fmt.Println("已有另一个 claudego 实例在运行，跳过本轮。")
@@ -24,12 +26,17 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	if maxPar < 1 {
 		maxPar = 1
 	}
+	rescan := time.Duration(cfg.DrainRescanSec) * time.Second
+	if rescan <= 0 {
+		rescan = 15 * time.Second
+	}
 
 	type doneMsg struct{ t *Task }
 	ch := make(chan doneMsg)
 	activeIDs := map[string]bool{}
 	activeDirs := map[string]bool{}
-	claimedDir := map[string]bool{} // 哪些在跑任务占用了目录互斥（只读类型不占用）
+	claimedDir := map[string]bool{}                  // 哪些在跑任务占用了目录互斥（只读类型不占用）
+	activeCancels := map[string]context.CancelFunc{} // 取消对账命中时击杀该任务的执行进程组
 	// 只读类型（审核/进度回收）不写文件：既不占用同目录互斥，也不被互斥挡住——
 	// 审核卡可与同仓下一批并行（依赖护栏在排批层：批内叶组互不依赖、不消费未过审契约）。
 	readOnly := func(t *Task) bool { return t.Type == typeReview || t.Type == typeProgressPull }
@@ -48,12 +55,25 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 			fmt.Printf("✖ %s 失败: %s（claudego log %s 查看详情）\n", t.ID, t.LastError, t.ID)
 		case statusQueued:
 			fmt.Printf("↻ %s 让位/重试，%s 后再跑（第 %d 次）: %s\n", t.ID, fmtClock(t.NotBeforeEpoch), t.Attempts, t.LastError)
+		case statusCanceled:
+			fmt.Printf("⏹ %s 已取消，执行进程已终止并归档。\n", t.ID)
 		}
 	}
 
 	for {
 		now := time.Now()
 		_ = os.Chtimes(lockPath(root), now, now) // 长时间 drain 时刷新锁，防止被当作陈旧锁清除
+
+		// 取消对账：cancel 命令跨进程摸不到这里的 cmd，只能写任务文件表态——每轮重扫
+		// 把在跑集合与盘上状态比对，已标 canceled（或文件被归档/删除）即取消其 ctx，
+		// cmd.Cancel 整组击杀（本地 claude/codex 与 ssh 同路径；远端进程杀不到，断开
+		// ssh 至少释放本地槽位）。runTask 归档返回后经 doneMsg 回收槽位与目录互斥，
+		// 同目录后续任务下一轮即可派发——否则该 dir 被吊到步骤超时，实测饿死近 1 小时。
+		for id, cancelRun := range activeCancels {
+			if diskCanceled(root, id) {
+				cancelRun()
+			}
+		}
 
 		blockReason := ""
 		if cd := loadCooldown(root); !force && cd.active(now) {
@@ -76,6 +96,12 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				viaCodex := map[string]bool{}
 				var cands []*Task
 				for _, t := range tasks {
+					if t.Status == statusCanceled {
+						if !activeIDs[t.ID] {
+							_ = archiveTask(root, t) // cancel 时执行器已不在场（如 daemon 重启过）的收尾归档
+						}
+						continue
+					}
 					if activeIDs[t.ID] || (activeDirs[t.Dir] && !readOnly(t)) {
 						continue
 					}
@@ -105,6 +131,8 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						activeDirs[next.Dir] = true
 						claimedDir[next.ID] = true
 					}
+					runCtx, cancelRun := context.WithCancel(context.Background())
+					activeCancels[next.ID] = cancelRun
 					launched++
 					if !quiet {
 						runner := ""
@@ -115,7 +143,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							next.ID, next.Type, next.Title, next.Step+1, len(next.Prompts), len(activeIDs), maxPar, runner)
 					}
 					go func(t *Task, viaCodex bool) {
-						if err := runTask(root, cfg, t, viaCodex); err != nil && !quiet {
+						if err := runTask(runCtx, root, cfg, t, viaCodex); err != nil && !quiet {
 							fmt.Printf("✖ %s 执行出错: %v\n", t.ID, err)
 						}
 						ch <- doneMsg{t}
@@ -154,9 +182,13 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				delete(activeDirs, msg.t.Dir)
 				delete(claimedDir, msg.t.ID)
 			}
+			if cancelRun := activeCancels[msg.t.ID]; cancelRun != nil {
+				cancelRun() // 正常完成也要释放 ctx，别泄漏
+				delete(activeCancels, msg.t.ID)
+			}
 			report(msg.t)
-		case <-time.After(15 * time.Second):
-			// 重扫超时：不动任何在跑任务，回循环顶用空闲槽位尝试派发新就绪任务。
+		case <-time.After(rescan):
+			// 重扫超时：不动任何在跑任务，回循环顶用空闲槽位尝试派发新就绪任务，并做取消对账。
 		}
 	}
 }
