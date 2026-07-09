@@ -183,6 +183,11 @@ func invokeRemoteClaude(cfg *Config, t *Task, prompt string) (*claudeResult, str
 	res := parseClaudeJSON(stdout.String())
 	if res == nil {
 		res = &claudeResult{Type: "result", IsError: true, Subtype: "remote_claude_error", Result: firstLine(combined)}
+	} else if runErr != nil && !res.IsError {
+		// 远端 claude 已把完整结果 JSON 打到 stdout,但它派生的后台子进程（如探针脚本）
+		// 可能吊着 ssh 管道不放,cmd.Run 只能等到超时才返回——结果在手即成功,
+		// 超时/非零退出只是收尾竞态（同 invokeRemoteCodex 的"有结果即成功"原则,实测 F2-R3 被误标 failed）。
+		runErr = nil
 	}
 	return res, combined, runErr
 }
