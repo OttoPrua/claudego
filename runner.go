@@ -43,6 +43,9 @@ var (
 	resetTimeRe = regexp.MustCompile(`(?i)reset[s]?\s*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
 	transientRe = regexp.MustCompile(`(?i)rate.?limit|overloaded|internal server error|api error 5\d\d|econnre|network error|timed? ?out`)
 	fencedRe    = regexp.MustCompile("(?s)```json\\s*(.*?)```")
+	// emit 容错阶梯用：任意语言标签的围栏（模型常漏写 json 标签）与输出中提到的 .json 文件名。
+	anyFencedRe = regexp.MustCompile("(?s)```[a-zA-Z]*[ \t]*\\n?(.*?)```")
+	jsonFileRe  = regexp.MustCompile(`[\w./\\-]+\.json`)
 )
 
 func invokeClaude(cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
@@ -562,41 +565,128 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 	}
 }
 
+type emitTask struct {
+	Title       string   `json:"title"`
+	Type        string   `json:"type"`
+	Dir         string   `json:"dir"`
+	Priority    int      `json:"priority"`
+	Model       string   `json:"model"`
+	SessionID   string   `json:"session_id"`
+	ReviewAfter bool     `json:"review_after"`
+	FreshSteps  bool     `json:"fresh_steps"`
+	Runner      string   `json:"runner"`
+	Prompts     []string `json:"prompts"`
+	// 模型常见的字段名漂移，做别名容错：steps=[...] / prompt="..." / 标题写成 role 或 id。
+	Steps  []string `json:"steps"`
+	Prompt string   `json:"prompt"`
+	Role   string   `json:"role"`
+	ID     string   `json:"id"`
+}
+
 type emitSpec struct {
-	Tasks []struct {
-		Title       string   `json:"title"`
-		Type        string   `json:"type"`
-		Dir         string   `json:"dir"`
-		Priority    int      `json:"priority"`
-		Model       string   `json:"model"`
-		SessionID   string   `json:"session_id"`
-		ReviewAfter bool     `json:"review_after"`
-		FreshSteps  bool     `json:"fresh_steps"`
-		Runner      string   `json:"runner"`
-		Prompts     []string `json:"prompts"`
-		// 模型常见的字段名漂移，做别名容错：steps=[...] / prompt="..."
-		Steps  []string `json:"steps"`
-		Prompt string   `json:"prompt"`
-	} `json:"tasks"`
+	Tasks []emitTask `json:"tasks"`
+}
+
+// parseEmitTasks 尝试把一段文本按 {"tasks":[...]} 或裸数组 [...] 解析成任务清单。
+// 解析不出或列表为空返回 nil。
+func parseEmitTasks(raw string) []emitTask {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var spec emitSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err == nil && len(spec.Tasks) > 0 {
+		return spec.Tasks
+	}
+	var arr []emitTask
+	if err := json.Unmarshal([]byte(raw), &arr); err == nil && len(arr) > 0 {
+		return arr
+	}
+	return nil
+}
+
+// extractEmitTasks 从模型输出里提取产出任务，容错阶梯（实战三次 emit 失败的教训——
+// 模型会漏写 json 围栏标签、把 JSON 混在叙述里、甚至只把清单写进文件不回显）：
+//  1. 围栏块（json 标签或裸围栏，内容以 {/[ 开头），后出现的优先；
+//  2. 未围栏平衡扫描：在 "tasks" 关键字前回溯 '{'，用 Decoder 解出首个合法对象；
+//  3. 文件救援：输出中提到的 .json 文件（限任务目录内），读文件解析。
+func extractEmitTasks(result, dir string) ([]emitTask, error) {
+	// ① 围栏块，后出现的优先（模型习惯把操作性 JSON 放最后）。
+	ms := anyFencedRe.FindAllStringSubmatch(result, -1)
+	for i := len(ms) - 1; i >= 0; i-- {
+		body := strings.TrimSpace(ms[i][1])
+		if !strings.HasPrefix(body, "{") && !strings.HasPrefix(body, "[") {
+			continue
+		}
+		if tasks := parseEmitTasks(body); tasks != nil {
+			return tasks, nil
+		}
+	}
+	// ② 未围栏：定位每个 "tasks" 出现点，向前回溯若干 '{' 逐一试解
+	// （最近的 '{' 可能落在嵌套对象或字符串内，逐层外推直到解出）。
+	for off := 0; ; {
+		k := strings.Index(result[off:], `"tasks"`)
+		if k < 0 {
+			break
+		}
+		pos := off + k
+		brace := pos
+		for attempt := 0; attempt < 32; attempt++ {
+			brace = strings.LastIndex(result[:brace], "{")
+			if brace < 0 {
+				break
+			}
+			var spec emitSpec
+			dec := json.NewDecoder(strings.NewReader(result[brace:]))
+			if err := dec.Decode(&spec); err == nil && len(spec.Tasks) > 0 {
+				return spec.Tasks, nil
+			}
+		}
+		off = pos + len(`"tasks"`)
+	}
+	// ③ 文件救援：模型把清单写进了任务目录下的 .json 文件（如 _WAVE-N-TASKS.json）。
+	if dir != "" {
+		base := filepath.Clean(dir)
+		seen := map[string]bool{}
+		for _, tok := range jsonFileRe.FindAllString(result, -1) {
+			p := strings.ReplaceAll(tok, "\\", "/")
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(base, p)
+			}
+			p = filepath.Clean(p)
+			// 只信任务目录内的文件，拒绝越界路径。
+			if p != base && !strings.HasPrefix(p, base+string(filepath.Separator)) {
+				continue
+			}
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			if fi, err := os.Stat(p); err != nil || fi.IsDir() || fi.Size() > 2<<20 {
+				continue
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			if tasks := parseEmitTasks(string(b)); tasks != nil {
+				return tasks, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("输出中没有合法的 tasks JSON（围栏/平衡扫描/文件救援均未命中）")
 }
 
 func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]string, error) {
-	raw := lastFencedJSON(result)
-	if raw == "" {
-		raw = strings.TrimSpace(result)
+	tasks, err := extractEmitTasks(result, parent.Dir)
+	if err != nil {
+		return nil, err
 	}
-	var spec emitSpec
-	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-		return nil, fmt.Errorf("输出中没有合法的 tasks JSON: %w", err)
-	}
-	if len(spec.Tasks) == 0 {
-		return nil, fmt.Errorf("tasks 列表为空")
-	}
-	if len(spec.Tasks) > 10 {
-		spec.Tasks = spec.Tasks[:10]
+	if len(tasks) > 10 {
+		tasks = tasks[:10]
 	}
 	var ids []string
-	for _, s := range spec.Tasks {
+	for _, s := range tasks {
 		if len(s.Prompts) == 0 && len(s.Steps) > 0 {
 			s.Prompts = s.Steps
 		}
@@ -617,6 +707,12 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 			dir = parent.Dir
 		}
 		title := s.Title
+		if title == "" {
+			title = s.Role
+		}
+		if title == "" {
+			title = s.ID
+		}
 		if title == "" {
 			title = "由 " + parent.ID + " 生成"
 		}
