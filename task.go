@@ -43,6 +43,15 @@ type Task struct {
 	// RemoteHost 非空时任务在该远程主机执行（SSH → 远端 codex），键入 Config.RemoteHosts。
 	// 让 5090 等机器进编排（跨机 dev，如 Trading）；要求 remoteEligible（单步/fresh、无 claude 会话）。
 	RemoteHost string `json:"remote_host,omitempty"`
+	// ReviewHost 非空时，本卡完成后自动派的对抗审核卡分流到该远程主机执行（键入 Config.RemoteHosts）。
+	// 用于把只读审核负载分流到第二台机器、平衡两侧模型额度；实现卡自身仍在原处执行。经修复链继承。
+	ReviewHost string `json:"review_host,omitempty"`
+	// ReviewDir 是审核卡在审核主机上的工作目录（镜像路径），与 ReviewHost 成对使用；
+	// 渲染审核模板 {{DIR}} 时替换实现卡的 Dir。经修复链继承。
+	ReviewDir string `json:"review_dir,omitempty"`
+	// ReviewSync 非空时，派审核卡前先在本地以 sh -c 执行该命令（如把改动 rsync 到审核主机）。
+	// 失败则回退本地审核——闭环绝不因分流失败而断。可单独存在（仅同步不分流）。经修复链继承。
+	ReviewSync string `json:"review_sync,omitempty"`
 	// MidStep 表示当前步骤执行到一半被限额打断：恢复时发送续跑提示而不是重发原 prompt。
 	MidStep bool `json:"mid_step,omitempty"`
 
