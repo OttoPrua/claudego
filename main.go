@@ -201,6 +201,9 @@ func cmdAdd(args []string) error {
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
+	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
+	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
+	reviewSync := fs.String("review-sync", "", "派审核卡前本地执行的同步命令（sh -c，如把改动 rsync 到审核主机）；失败则回退本地审核")
 	_ = fs.Parse(args)
 
 	root := resolveRoot(*rootFlag)
@@ -288,6 +291,19 @@ func cmdAdd(args []string) error {
 			return fmt.Errorf("config.json 的 remote_hosts 未配置主机 %q", *host)
 		}
 	}
+	// 审核分流：-review-host 与 -review-dir 成对（都指审核主机上的镜像执行位置）；
+	// -review-sync 可单独存在（仅同步不分流的场景）。
+	if (*reviewHost == "") != (*reviewDir == "") {
+		return fmt.Errorf("-review-host 与 -review-dir 必须成对指定")
+	}
+	if *reviewHost != "" {
+		if _, ok := cfg.RemoteHosts[*reviewHost]; !ok {
+			return fmt.Errorf("config.json 的 remote_hosts 未配置审核主机 %q", *reviewHost)
+		}
+	}
+	t.ReviewHost = *reviewHost
+	t.ReviewDir = *reviewDir
+	t.ReviewSync = *reviewSync
 	if err := saveTask(root, t); err != nil {
 		return err
 	}

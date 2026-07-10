@@ -82,6 +82,9 @@ func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 	cmd.Stderr = &stderr
 
 	runErr := runCmdRegistered(cmd)
+	// 本地 claude exit 0 但派生子进程（MCP server/hook/探针）吊住 stdout 管道触发 WaitDelay 时，
+	// 结果 JSON 已在 stdout 却被 ErrWaitDelay 误判失败、白白重试。远端两支已有"有结果即成功"救援。
+	runErr = rescueWaitDelay(runErr, cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -122,6 +125,9 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	runErr := runCmdRegistered(cmd)
+	// codex exit 0 但派生子进程吊住 stdout 管道触发 WaitDelay 时，-o 结果文件已写好却因 ErrWaitDelay
+	// 被下方 `runErr != nil` 判定标 IsError、白白重试。同 runReviewSync/invokeClaude 的同类救援。
+	runErr = rescueWaitDelay(runErr, cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -138,7 +144,7 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	return res, combined, runErr
 }
 
-// invokeRemoteClaude 通过 SSH 在远程主机上跑 claude -p（远程 fable 设计等，用该主机自己的 claude 账号）。
+// invokeRemoteClaude 通过 SSH 在远程主机上跑 claude -p（远程 opus 设计等，用该主机自己的 claude 账号）。
 // prompt 走 ssh stdin；claude -p --output-format json 直接把结果 JSON 打到 stdout（无需 marker/文件，复用 parseClaudeJSON）。
 // claude -p 无 -C 参数，故先 cd 到工作目录（cmd 用 cd /d + 反斜杠，posix 用 cd + 正斜杠）。
 func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
@@ -281,6 +287,13 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 		runErr = fmt.Errorf("远端 codex 无结果输出（marker 后为空）")
 	}
 	return res, combined, runErr
+}
+
+// remoteUsesClaude 判定远端任务走远端 claude(true)还是远端 codex(false)：
+// 带 claude 模型走 claude；只读审核卡(typeReview)强制走 claude——审核分流的立项目标是平衡
+// 两侧 claude 额度,空 Model 也绝不路由到烧 GPT 额度的远端 codex(空则用远端账号默认模型)。
+func remoteUsesClaude(t *Task) bool {
+	return t.Model != "" || t.Type == typeReview
 }
 
 // codexEligible 判断任务能否交给备用执行器：没有 claude 会话要延续即可——
@@ -434,9 +447,11 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		var runErr error
 		switch {
 		case remote:
-			// 远端执行：带 claude 模型(如 fable)走远端 claude；否则走远端 codex。
+			// 远端执行：带 claude 模型(如 opus)走远端 claude；只读审核卡强制走远端 claude——
+			// 审核分流的立项目标是平衡两侧 claude 额度,绝不把审核路由到烧 GPT 额度的远端 codex
+			// (即便 Model 为空,空则用远端账号默认模型)。其余无模型的填充类任务仍走远端 codex。
 			// 两者都走该远端主机自己的账号额度，不记本机 claude 账本、不写全局冷却。
-			if t.Model != "" {
+			if remoteUsesClaude(t) {
 				res, combined, runErr = invokeRemoteClaude(ctx, cfg, t, prompt)
 			} else {
 				res, combined, runErr = invokeRemoteCodex(ctx, cfg, t, prompt)
@@ -481,7 +496,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			return saveTask(root, t)
 		}
 
-		// 1b) 远端撞该主机账号限额（如 5090 的 fable/GPT 账号）：按本任务 resume_at 挂起，
+		// 1b) 远端撞该主机账号限额（远端机器自己的 claude/GPT 账号）：按本任务 resume_at 挂起，
 		// 不写全局冷却（远端账号与本机独立）；eligible() 到刷新时刻才再派 → 无损接力自动续跑。
 		if remote && isLimitHit(res, combined) {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
@@ -570,6 +585,39 @@ func finalizeCanceled(root string, t *Task, lg *os.File) error {
 	return nil
 }
 
+// runReviewSync 在本地以 sh -c 执行审核分流的同步命令（如把改动 rsync 到审核主机），
+// stdout/stderr 落任务日志，120s 超时。返回非 nil 即视为同步失败，调用方回退本地审核。
+// 已知竞态（记录不修）：同步在 ~110s+ 完成且孙进程仍吊住管道时，WaitDelay 的 10s 收尾会跨过
+// 120s deadline，成功的同步被误报为超时→回退本地审。窗口极窄且回退无害（多审一次本机），不值复杂化。
+func runReviewSync(t *Task, lg *os.File) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", t.ReviewSync)
+	// 同步命令以实现卡 Dir 为工作目录执行：本库本地执行器（invokeClaude/invokeCodex）均 cmd.Dir=t.Dir，
+	// 不钉的话命令在 daemon 进程 cwd 跑，用户写 'rsync -a --delete ./ hostb:/mirror/' 等相对路径命令时
+	// 会静默同步 daemon 启动目录、--delete 清空远端镜像，审核对错误代码出 verdict 喂进修复链且全程无报错。
+	cmd.Dir = t.Dir
+	// setupProcGroup 给 cmd 设 Setpgid + Cancel（超时整组击杀）+ WaitDelay=10s：
+	// rsync 派生的 ssh 孙进程握住 stdout 管道写端时，只 kill 直接子进程 Wait 永不返回，
+	// postComplete 卡死、并行槽位与 dir 互斥永久泄漏（同 b84de71 已踩过的坑）。用 buffer 而非
+	// CombinedOutput 内建管道，配合 WaitDelay 在超时/孙进程吊管道时强制收尾。runCmdRegistered
+	// 登记进程供 Ctrl-C/SIGTERM 连坐击杀。
+	setupProcGroup(cmd)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := runCmdRegistered(cmd)
+	// 救援：sync 命令 exit 0 但派生后台子进程握住 stdout 管道（ssh mux、rsync -e ssh）时，
+	// WaitDelay 到点 cmd.Wait 返回 ErrWaitDelay 而非 nil，但进程本身成功退出。不救则成功的同步
+	// 被误判失败→postComplete 收掉 divert、每轮回退本机审核，分流特性静默失效（已独立探针实测）。
+	err = rescueWaitDelay(err, cmd)
+	logBlock(lg, "REVIEW-SYNC", fmt.Sprintf("$ %s\n%s", t.ReviewSync, strings.TrimSpace(buf.String())))
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("同步命令超时（120s）")
+	}
+	return err
+}
+
 // postComplete 处理任务链：进度报告落盘；装配/协调任务产出的新任务入队；review_after 自动入队设计审核。
 func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
 	if t.EmitProgress {
@@ -599,13 +647,38 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 	if t.ReviewAfter {
 		tpl, err := loadTemplate(root, typeReview)
 		if err == nil {
+			// 审核默认在被审卡所在处执行（远程卡在远程审）；声明 ReviewHost/ReviewSync 时把只读审核
+			// 负载分流到第二台机器。分流前若有 ReviewSync 先本地同步改动，失败则只收掉 divert——
+			// reviewHost/reviewDir 回到初值 t.RemoteHost/t.Dir（远程实现卡仍在远程审，绝不抹主机把审核
+			// 错拉回本机以远端路径当本地目录），闭环不断。
+			reviewDir := t.Dir
+			reviewHost := t.RemoteHost
+			divert := t.ReviewHost != ""
+			if t.ReviewSync != "" {
+				if err := runReviewSync(t, lg); err != nil {
+					logBlock(lg, "REVIEW", "审核同步失败，回退本地审核: "+err.Error())
+					divert = false
+				}
+			}
+			if divert {
+				reviewDir = t.ReviewDir
+				reviewHost = t.ReviewHost
+			}
 			focus := fmt.Sprintf("审查任务「%s」刚刚在该目录产生的改动（可结合 git diff/log）", t.Title)
-			prompt := renderTemplate(tpl, map[string]string{"DIR": t.Dir, "FOCUS": focus})
-			rv := newTask(root, cfg, typeReview, "审核: "+t.Title, t.Dir, []string{prompt}, t.Priority)
-			// 修复闭环谱系：审核卡记住被审卡，并继承其循环轮次与执行位置（远程卡在远程审）。
+			prompt := renderTemplate(tpl, map[string]string{"DIR": reviewDir, "FOCUS": focus})
+			rv := newTask(root, cfg, typeReview, "审核: "+t.Title, reviewDir, []string{prompt}, t.Priority)
+			// 修复闭环谱系：审核卡记住被审卡，并继承其循环轮次与（分流后的）执行位置。
 			rv.ReviewOf = t.ID
 			rv.FixRound = t.FixRound
-			rv.RemoteHost = t.RemoteHost
+			rv.RemoteHost = reviewHost
+			// 远程审核（分流或远程实现卡回退）的模型选取：非空烘焙值恒优先，空才继承实现卡模型。
+			// newTask 已从 type_defaults.review.model 烘焙 rv.Model；仅当它为空（typeDefaults 未配审核模型）
+			// 才继承实现卡 Model，保证远端命中 claude 而非烧 GPT 额度的 codex。绝不用实现卡 Model 覆写非空烘焙值——
+			// 否则 type_defaults.review.model=opus + 实现卡 -model haiku 时审核会被静默降级成 haiku（本地审核却仍用
+			// opus），配置的审核模型被践踏。runTask 对 typeReview 亦兜底走远端 claude，空 Model 不会被路由到远端 codex。
+			if reviewHost != "" && rv.Model == "" {
+				rv.Model = t.Model
+			}
 			if saveTask(root, rv) == nil {
 				logBlock(lg, "REVIEW", "已入队审核任务: "+rv.ID)
 			}
@@ -870,7 +943,13 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 最新一轮未闭合项：
 %s
 审核摘要：%s`, base, maxRounds, v.Verdict, findings, v.Summary)
-		esc := newTask(root, cfg, typeSequence, fmt.Sprintf("[超轮限R%d·需人裁] %s", round, base), t.Dir, []string{prompt}, t.Priority)
+		// held 升级卡用被审卡（实现卡）的 Dir：远程审核分流时审核卡 Dir 是镜像路径，
+		// 人裁应回到实现卡本处。orig 已在上文取到（不可得时才退回 t.Dir）。
+		escDir := orig.Dir
+		if escDir == "" {
+			escDir = t.Dir
+		}
+		esc := newTask(root, cfg, typeSequence, fmt.Sprintf("[超轮限R%d·需人裁] %s", round, base), escDir, []string{prompt}, t.Priority)
 		esc.Status = statusHeld
 		esc.FixRound = round
 		if saveTask(root, esc) == nil {
@@ -901,6 +980,10 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt.PermissionMode = orig.PermissionMode
 	nt.AllowedTools = append([]string(nil), orig.AllowedTools...)
 	nt.RemoteHost = orig.RemoteHost
+	// 审核分流三字段随修复链继承：下一轮修复完成后的审核继续分流到审核主机。
+	nt.ReviewHost = orig.ReviewHost
+	nt.ReviewDir = orig.ReviewDir
+	nt.ReviewSync = orig.ReviewSync
 	nt.Closeout = orig.Closeout // 收口指令随修复链继承，pass 时才由末轮触发
 	// 修复是最该多想的环节：未显式指定时抬到 high（质量优先）。不继承 PreferRunner——
 	// 修复吃上下文推理，钉 codex 的填充类偏好不适用。
