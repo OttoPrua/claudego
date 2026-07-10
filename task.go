@@ -55,6 +55,10 @@ type Task struct {
 	// FixRound: "实现→对抗审核→修复"循环轮次。实现卡 0，第 n 轮自动修复卡为 n；审核卡继承被审卡轮次。
 	// 达到 config.max_fix_rounds 后不再自动派修复，改挂 held 升级卡交人工/设计权威裁定。
 	FixRound int `json:"fix_round,omitempty"`
+	// Closeout: 收口回写指令（opt-in）。非空时，本卡的对抗复审 verdict=pass 后，自动入队一张
+	// 廉价（haiku）收口卡跑此 prompt——把"done"回写权威账本的动作绑定到 pass 事件而非实现卡自评，
+	// 根治"实现卡提前自标 done / 老实等审却 pass 后没人翻"的双真相源漂移。经修复链继承。
+	Closeout string `json:"closeout,omitempty"`
 	// FreshSteps 表示步骤间不 --resume：每一步都是全新会话（配合"状态在文件里"的项目规约，
 	// prompt 自带读状态文件的开工动作）。永不依赖会话记忆，也就不会撞会话上下文上限。
 	FreshSteps bool `json:"fresh_steps,omitempty"`

@@ -821,6 +821,19 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	}
 	if v.Verdict == "pass" {
 		logBlock(lg, "FIXLOOP", fmt.Sprintf("复审 PASS（第 %d 轮收口）: %s", t.FixRound, v.Summary))
+		// 收口回写：pass 是权威的"done"事件。若被审卡带 Closeout 指令，入队一张廉价收口卡
+		// 把 done 回写账本（绑定到 pass 而非实现卡自评，根治 frontmatter 双真相源漂移）。
+		if t.ReviewOf != "" {
+			if orig, err := findTaskAnywhere(root, t.ReviewOf); err == nil && strings.TrimSpace(orig.Closeout) != "" {
+				co := newTask(root, cfg, typeSequence, "收口: "+baseFixTitle(orig.Title), orig.Dir, []string{orig.Closeout}, orig.Priority)
+				co.Model = "haiku"
+				co.SkipPermissions = orig.SkipPermissions
+				co.RemoteHost = orig.RemoteHost
+				if saveTask(root, co) == nil {
+					logBlock(lg, "FIXLOOP", "已入队收口卡 "+co.ID+"（pass→回写账本 done）")
+				}
+			}
+		}
 		return
 	}
 	if t.ReviewOf == "" {
@@ -888,6 +901,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt.PermissionMode = orig.PermissionMode
 	nt.AllowedTools = append([]string(nil), orig.AllowedTools...)
 	nt.RemoteHost = orig.RemoteHost
+	nt.Closeout = orig.Closeout // 收口指令随修复链继承，pass 时才由末轮触发
 	// 修复是最该多想的环节：未显式指定时抬到 high（质量优先）。不继承 PreferRunner——
 	// 修复吃上下文推理，钉 codex 的填充类偏好不适用。
 	nt.Effort = orig.Effort

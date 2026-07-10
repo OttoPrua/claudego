@@ -119,7 +119,56 @@ func TestFixLoopPassStops(t *testing.T) {
 	passReport := "```json\n{\"verdict\":\"pass\",\"p0\":[],\"p1\":[],\"p2\":[],\"summary\":\"过\"}\n```"
 	handleReviewVerdict(root, cfg, rv, passReport, nil)
 	if len(listQueued(t, root)) != before {
-		t.Fatal("pass 不应产生任何新卡")
+		t.Fatal("pass 不应产生任何新卡（无 closeout 时）")
+	}
+}
+
+func TestFixLoopPassEmitsCloseout(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	impl := mkImplTask(t, root, cfg)
+	impl.Closeout = "把叶卡 X frontmatter status 改为 done 并记 _LOG"
+	if err := saveTask(root, impl); err != nil {
+		t.Fatal(err)
+	}
+	rv := mkReviewTask(t, root, cfg, impl)
+	passReport := "```json\n{\"verdict\":\"pass\",\"p0\":[],\"p1\":[],\"p2\":[],\"summary\":\"过\"}\n```"
+	handleReviewVerdict(root, cfg, rv, passReport, nil)
+	var co *Task
+	for _, x := range listQueued(t, root) {
+		if strings.HasPrefix(x.Title, "收口: ") {
+			co = x
+		}
+	}
+	if co == nil {
+		t.Fatal("带 closeout 的卡 pass 后应入队收口卡")
+	}
+	if co.Model != "haiku" || co.Prompts[0] != impl.Closeout || co.Dir != impl.Dir {
+		t.Fatalf("收口卡参数错误: %+v", co)
+	}
+	if co.ReviewAfter {
+		t.Fatal("收口卡不应再挂审核")
+	}
+}
+
+func TestFixLoopCloseoutInheritsThroughFix(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	impl := mkImplTask(t, root, cfg)
+	impl.Closeout = "写回 done"
+	if err := saveTask(root, impl); err != nil {
+		t.Fatal(err)
+	}
+	rv := mkReviewTask(t, root, cfg, impl)
+	handleReviewVerdict(root, cfg, rv, reviewReport, nil) // concerns → 修复R1
+	var fix *Task
+	for _, x := range listQueued(t, root) {
+		if strings.HasPrefix(x.Title, "修复R1: ") {
+			fix = x
+		}
+	}
+	if fix == nil || fix.Closeout != "写回 done" {
+		t.Fatalf("修复卡应继承 closeout: %+v", fix)
 	}
 }
 

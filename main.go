@@ -198,6 +198,7 @@ func cmdAdd(args []string) error {
 	permMode := fs.String("permission-mode", "", "覆盖权限模式")
 	model := fs.String("model", "", "覆盖模型（haiku/sonnet/opus 或完整模型名）")
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
+	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	_ = fs.Parse(args)
@@ -267,6 +268,7 @@ func cmdAdd(args []string) error {
 		}
 		t.Effort = *effort
 	}
+	t.Closeout = *closeout
 	t.FreshSteps = *fresh
 	if *runner == "codex" {
 		t.PreferRunner = "codex"
