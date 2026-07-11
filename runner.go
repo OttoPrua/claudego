@@ -192,10 +192,14 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 	cmd := exec.CommandContext(ctx, sshBin, "-o", "BatchMode=yes", t.RemoteHost, remoteCmd)
 	setupProcGroup(cmd)
 	cmd.Stdin = strings.NewReader(prompt)
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr syncBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := runCmdRegistered(cmd)
+	// 早收割看门狗：结果 JSON 已完整落缓冲而 ssh 因远端孙进程吊管道不退时，
+	// 两拍后整组击杀（实测曾挂满 150 分钟：完成品不被收割 + 目录锁堵死串行队列）。
+	runErr := runCmdRegisteredHarvest(cmd, func() bool {
+		return parseClaudeJSON(stdout.String()) != nil
+	})
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -204,9 +208,8 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 	if res == nil {
 		res = &claudeResult{Type: "result", IsError: true, Subtype: "remote_claude_error", Result: firstLine(combined)}
 	} else if runErr != nil && !res.IsError {
-		// 远端 claude 已把完整结果 JSON 打到 stdout,但它派生的后台子进程（如探针脚本）
-		// 可能吊着 ssh 管道不放,cmd.Run 只能等到超时才返回——结果在手即成功,
-		// 超时/非零退出只是收尾竞态（同 invokeRemoteCodex 的"有结果即成功"原则,实测 F2-R3 被误标 failed）。
+		// 远端 claude 已把完整结果 JSON 打到 stdout,但收尾被吊住（见上）或退出竞态非零——
+		// 结果在手即成功：看门狗击杀的退出码在此洗白（同 invokeRemoteCodex 的"有结果即成功"原则）。
 		runErr = nil
 	}
 	return res, combined, runErr
