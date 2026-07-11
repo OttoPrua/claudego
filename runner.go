@@ -956,6 +956,9 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		}
 		esc := newTask(root, cfg, typeSequence, fmt.Sprintf("[超轮限R%d·需人裁] %s", round, base), escDir, []string{prompt}, t.Priority)
 		esc.Status = statusHeld
+		// 远端链的升级卡必须继承执行主机：dir 是远端路径（如 D:/...），缺 remote_host
+		// 会在 release 后被派到本机、cd 直接失败（实测远端 R4 卡两张踩中）。
+		esc.RemoteHost = orig.RemoteHost
 		esc.FixRound = round
 		if saveTask(root, esc) == nil {
 			logBlock(lg, "FIXLOOP", fmt.Sprintf("超轮限（R%d>上限%d），已挂 held 升级卡 %s 交人工裁定", round, maxRounds, esc.ID))
