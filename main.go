@@ -36,6 +36,8 @@ func main() {
 		err = cmdAdopt(os.Args[2:])
 	case "plan":
 		err = cmdPlan(os.Args[2:])
+	case "cross":
+		err = cmdCross(os.Args[2:])
 	case "brief":
 		err = cmdBrief(os.Args[2:])
 	case "progress":
@@ -100,6 +102,9 @@ func printUsage() {
   review    [-dir D] [-priority N] [-model M] [-session S] ["关注点"]
             设计审核：只读审查产出分级报告；-session 挂到既有审核角色会话
   adopt     <session-id> [-dir D] [-model M] ["续跑提示"]  # 接管一个被限额打断的既有会话
+  cross     [-profile NAME] [-dir D] [-priority N] [-title T] [-file f] "任务内容"
+            交叉验证（设计档顶替流）：引擎甲(如 claude opus)独立作答 → 引擎乙(如 codex)独立作答后
+            拿甲的结论对抗式交叉查漏；两侧都走第一性原理+对抗式审查。-list 看可用引擎对
 
 进度回收与分工协调
   sessions  [-dir D] [-n 10]              # 列出该项目最近的 claude 会话（桌面端与 CLI 同池）
@@ -235,10 +240,10 @@ func cmdAdd(args []string) error {
 
 	var wd string
 	if *host != "" {
-		// 远端任务：-dir 是远端主机上的路径（如 D:/Project/Trading），不做本地校验。
+		// 远端任务：-dir 是远端主机上的路径（如 D:/Project/MyApp），不做本地校验。
 		wd = strings.TrimSpace(*dir)
 		if wd == "" {
-			return fmt.Errorf("-host 远程任务必须显式指定 -dir（远端工作目录，如 D:/Project/Trading）")
+			return fmt.Errorf("-host 远程任务必须显式指定 -dir（远端工作目录，如 D:/Project/MyApp）")
 		}
 	} else {
 		wd, err = resolveDir(*dir)
@@ -308,6 +313,188 @@ func cmdAdd(args []string) error {
 		return err
 	}
 	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d）\n", t.ID, t.Type, t.Title, len(t.Prompts), t.Priority)
+	return nil
+}
+
+// cmdCross 铺设一条交叉验证链（fable 顶替流）：只入队引擎甲的 A 卡，B/C 由 runner 在
+// 各上游卡完成后自动派出（引擎乙独立作答 B → 引擎乙拿甲结论交叉查漏 C）。模型来源靠 profile 切换。
+func cmdCross(args []string) error {
+	fs := flag.NewFlagSet("cross", flag.ExitOnError)
+	rootFlag := fs.String("root", "", "数据目录")
+	profile := fs.String("profile", "", "引擎对 profile 名（config.cross_profiles；默认 config.default_cross_profile）")
+	dir := fs.String("dir", "", "工作目录（默认当前目录；远端引擎时为远端路径）")
+	title := fs.String("title", "", "任务标题")
+	priority := fs.Int("priority", 0, "优先级，越大越先跑")
+	file := fs.String("file", "", "从文件读取任务内容")
+	list := fs.Bool("list", false, "列出可用的引擎对 profile 后退出")
+	_ = fs.Parse(args)
+
+	root := resolveRoot(*rootFlag)
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+
+	if *list {
+		return listCrossProfiles(cfg)
+	}
+
+	// 读任务内容（-file 或命令行剩余参数）。
+	var task string
+	if *file != "" {
+		data, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		task = strings.TrimSpace(string(data))
+	} else {
+		task = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	}
+	if task == "" {
+		_ = listCrossProfiles(cfg)
+		return fmt.Errorf("缺少任务内容：直接写在命令行，或用 -file 指定")
+	}
+
+	// 解析 profile。
+	name := *profile
+	if name == "" {
+		name = cfg.DefaultCrossProfile
+	}
+	if name == "" {
+		return fmt.Errorf("未指定 -profile 且 config.default_cross_profile 为空")
+	}
+	prof, ok := cfg.CrossProfiles[name]
+	if !ok {
+		return fmt.Errorf("未知 profile %q（claudego cross -list 查看可用引擎对）", name)
+	}
+	// 甲乙必须同执行位置：交叉链 A/B/C 共用一个工作目录，跨机/本机-远端混排会让 B/C 拿错目录。
+	if la, lb := crossEngineLoc(prof.A), crossEngineLoc(prof.B); la != lb {
+		return fmt.Errorf("profile %q 的甲乙引擎执行位置不同（%s vs %s）：交叉链共用一个工作目录，一对引擎须同在本机或同一远端主机", name, la, lb)
+	}
+	// 甲乙必须是**不同引擎**：同 kind+同模型（codex 同 codex_model / claude 同 model / 远端同 host+model）=
+	// 单引擎自审，交叉验证形同虚设。
+	if ia, ib := crossEngineIdentity(prof.A, cfg), crossEngineIdentity(prof.B, cfg); ia == ib {
+		return fmt.Errorf("profile %q 的甲乙是同一引擎（%s）：交叉验证要求两个不同引擎，否则退化为单引擎自审", name, ia)
+	}
+
+	// 工作目录：引擎甲是远端时 -dir 为远端路径，不做本地校验。
+	var wd string
+	aRemote := crossEngineLoc(prof.A) != "local"
+	if aRemote {
+		wd = strings.TrimSpace(*dir)
+		if wd == "" {
+			return fmt.Errorf("引擎甲是远端执行器，必须显式指定 -dir（远端工作目录）")
+		}
+	} else {
+		wd, err = resolveDir(*dir)
+		if err != nil {
+			return err
+		}
+		// 工作目录不得是（或位于）claudego 数据根——否则交叉卡的 cwd 直接含 tasks/，B 一读就看到 A 卡。
+		// 解符号链接后比对（否则 /tmp→/private/tmp 或软链数据根可绕过守卫）。
+		cleanWd, cleanRoot := resolveSymPath(wd), resolveSymPath(root)
+		sep := string(os.PathSeparator)
+		// 拒：数据根本身、其子目录、或其**父目录**（-dir=$HOME 时 cwd 直接包含 $HOME/.claudego）。
+		if cleanWd == cleanRoot || strings.HasPrefix(cleanWd, cleanRoot+sep) || strings.HasPrefix(cleanRoot, cleanWd+sep) {
+			return fmt.Errorf("-dir 不能是 claudego 数据根、其子目录或其父目录（数据根 %s）：交叉卡工作目录会包含/暴露编排态", cleanRoot)
+		}
+		// 若工作目录是 git 仓，注入 HEAD 作代码评审锚点。**这是非强制 advisory**：本工具不做工作树
+		// 快照/checkout，未提交改动 HEAD 不变——故若工作树脏，额外警告"链执行期间勿改动"。（诚实降级，
+		// 不谎称快照钉固：真正的同代码态需你自己在链执行前提交或保持工作树不变。）
+		if sha := gitHeadSha(wd); sha != "" {
+			anchor := fmt.Sprintf("\n\n[代码锚点·非强制] 若本任务涉及代码，以 git 提交 %s 为准评估。", sha)
+			if gitTreeDirty(wd) {
+				anchor += "注意：工作树当前有**未提交改动**，本工具不做快照——请确保交叉链 A/B/C 执行期间不再改动它，否则三腿可能审的不是同一代码态。"
+			}
+			task += anchor
+		}
+	}
+
+	tpl, err := loadTemplate(root, "crosscheck-solo")
+	if err != nil {
+		return err
+	}
+	solo := renderTemplate(tpl, map[string]string{"TASK": task})
+
+	// 套引擎甲；谱系键用不透明随机键（非 A 卡 ID）；把乙引擎**解析成冻结规格**钉进 A 卡随链传递，
+	// B/C 执行时直接套用、不再从当前 config 重解析（防"入队后改 profile/codex_model 静默换引擎"漂移）。
+	a := newTask(root, cfg, typeCrossCheck, "交叉A["+name+"]: "+orDefaultTitle(*title, task), wd, []string{solo}, *priority)
+	a.XRole = "A"
+	a.XKey = newCrossKey()
+	a.XProfile = name
+	a.XTask = task
+	if err := applyCrossEngine(a, prof.A, cfg); err != nil {
+		return fmt.Errorf("引擎甲(%s): %w", crossEngineLabel(prof.A), err)
+	}
+	if prof.A.Kind == "codex" || prof.A.Kind == "remote-codex" {
+		a.XCodexModel = cfg.CodexModel // 甲若是 codex,也冻结其模型
+	}
+	frozenB, err := freezeCrossEngine(prof.B, cfg) // 解析+校验+冻结乙引擎（含 codex 模型）
+	if err != nil {
+		return fmt.Errorf("引擎乙(%s): %w", crossEngineLabel(prof.B), err)
+	}
+	a.XEngineB = frozenB
+	if err := saveTask(root, a); err != nil {
+		return err
+	}
+	fmt.Printf(`已入队交叉验证链 [%s]  甲=%s  乙=%s
+  A %s  引擎甲独立作答（第一性原理+对抗式自审）
+  ↓ 完成后自动派：
+  B      引擎乙独立作答（不见甲结论、无 A 指针）
+  ↓ 完成后自动派：
+  C      引擎乙拿甲结论对抗式交叉查漏 → 结论落进度报告
+链 ID: %s   最终结论: claudego progress -show %s   A 卡日志: claudego log %s
+工作目录: %s
+`, name, crossEngineLabel(prof.A), crossEngineLabel(prof.B), a.ID, a.XKey, a.XKey, a.ID, wd)
+	return nil
+}
+
+// gitHeadSha 返回目录当前 git HEAD 的完整 sha；非 git 仓/出错时返回空串。
+func gitHeadSha(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitTreeDirty 判断工作树是否有未提交改动（git status --porcelain 非空）。非 git 仓/出错返回 false。
+func gitTreeDirty(dir string) bool {
+	out, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// resolveSymPath 解析符号链接后返回清理过的绝对路径；解析失败退回 filepath.Clean（用于路径包含判定）。
+func resolveSymPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return filepath.Clean(r)
+	}
+	return filepath.Clean(p)
+}
+
+// listCrossProfiles 打印可用的交叉验证引擎对。
+func listCrossProfiles(cfg *Config) error {
+	if len(cfg.CrossProfiles) == 0 {
+		fmt.Println("（config.cross_profiles 为空，无可用引擎对）")
+		return nil
+	}
+	fmt.Println("可用交叉验证引擎对（-profile）:")
+	var names []string
+	for n := range cfg.CrossProfiles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		p := cfg.CrossProfiles[n]
+		def := ""
+		if n == cfg.DefaultCrossProfile {
+			def = "  (默认)"
+		}
+		fmt.Printf("  %-14s 甲=%s  乙=%s%s\n", n, crossEngineLabel(p.A), crossEngineLabel(p.B), def)
+	}
 	return nil
 }
 
@@ -723,6 +910,14 @@ func reportStatus(r map[string]any) string {
 	if isRawReport(r) {
 		return "[raw] " + oneLine(rptStr(r["raw"]))
 	}
+	// 交叉验证合并报告（含 verdict）：给列表一行「⚖ 结论」，否则计数/现状路径全落空显 —。
+	if v := strings.TrimSpace(rptStr(r["verdict"])); v != "" {
+		s := oneLine(rptStr(r["summary"]))
+		if s == "" {
+			s = oneLine(v)
+		}
+		return "⚖ " + s
+	}
 	ip := strings.TrimSpace(rptStr(r["in_progress"]))
 	if ip != "" && !strings.HasPrefix(ip, "无") && !strings.EqualFold(ip, "none") && !strings.EqualFold(ip, "n/a") {
 		return "▶ " + oneLine(ip)
@@ -756,6 +951,23 @@ func renderReport(e *ProgressEntry, full bool) {
 	if isRawReport(r) {
 		fmt.Println("\n[原文兜底 raw]")
 		fmt.Println(rptStr(r["raw"]))
+		return
+	}
+	// 交叉验证合并报告：按 结论→置信度→摘要→双方一致/分歧/仅甲/仅乙/残留风险 渲染（否则全落空只印表头）。
+	if v := strings.TrimSpace(rptStr(r["verdict"])); v != "" {
+		fmt.Printf("\n交叉验证结论: %s", v)
+		if conf := strings.TrimSpace(rptStr(r["confidence"])); conf != "" {
+			fmt.Printf("   置信度: %s", conf)
+		}
+		fmt.Println()
+		if s := strings.TrimSpace(rptStr(r["summary"])); s != "" {
+			fmt.Printf("摘要: %s\n", s)
+		}
+		printReportList("双方一致", rptArr(r["agreements"]))
+		printReportList("分歧裁断", rptArr(r["disagreements"]))
+		printReportList("仅甲发现", rptArr(r["only_A"]))
+		printReportList("仅乙发现", rptArr(r["only_B"]))
+		printReportList("残留风险", rptArr(r["residual_risks"]))
 		return
 	}
 	if g := strings.TrimSpace(rptStr(r["goal"])); g != "" {

@@ -93,6 +93,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					return err
 				}
 			} else {
+				reconcileCrossChains(root, tasks, activeIDs) // 崩溃对账：单腿孤儿交叉卡置 failed
 				viaCodex := map[string]bool{}
 				var cands []*Task
 				for _, t := range tasks {
@@ -115,9 +116,16 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						}
 					case t.PreferRunner == "codex" && cfg.CodexBin != "" && codexEligible(t):
 						viaCodex[t.ID] = true
+					case t.PreferRunner == "codex":
+						// codex 钉定但上面条件没满足（codex_bin 缺失/不 eligible）：绝不 fail-open 到 claude。
+						// 引擎身份是交叉验证的交付物——甲乙跑成同引擎=验证形同虚设。跳过本轮，等 codex 可用。
+						continue
 					case blockReason == "":
 						// claude 可用，正常走
-					case cfg.CodexFallback && cfg.CodexBin != "" && codexEligible(t) && !noFallback(cfg, t.Model):
+					case cfg.CodexFallback && cfg.CodexBin != "" && codexEligible(t) && !noFallback(cfg, t.Model) && t.Type != typeCrossCheck:
+						// 交叉验证卡的引擎身份就是交付物：claude 引擎的交叉卡(如甲=opus)绝不能被通用 codex
+						// 降级偷换成 codex——否则甲乙同引擎,交叉验证形同虚设。它宁可排队等 claude 窗口。
+						// (乙的 B/C 卡带 PreferRunner=codex,走上面首个 case,不受此影响。)
 						viaCodex[t.ID] = true
 					default:
 						continue // claude 被拦且没有 codex 出路
@@ -174,7 +182,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		}
 		// 等一个任务完成；或定时超时后回到循环顶重扫队列——让 drain 期间新入队的任务
 		// （尤其分离执行器，如远端主机的并行设计循环）能及时补进空闲槽位，
-		// 而不必干等某个在跑的长任务结束（否则 Mac 与 5090 的并行设计线会被串行化）。
+		// 而不必干等某个在跑的长任务结束（否则本机与远端主机的并行设计线会被串行化）。
 		select {
 		case msg := <-ch:
 			delete(activeIDs, msg.t.ID)

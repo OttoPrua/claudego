@@ -60,7 +60,10 @@ type Config struct {
 	CodexBin      string `json:"codex_bin"`
 	CodexFallback bool   `json:"codex_fallback"`
 	CodexModel    string `json:"codex_model,omitempty"`
-	// CodexReasoning 透传 -c model_reasoning_effort（minimal/low/medium/high/xhigh），空则用 codex 默认。
+	// CodexReasoning 透传 -c model_reasoning_effort，空则用 codex 默认。合法档位（实测 codex 0.144.1，
+	// 由低到高）：minimal < low < medium < high < xhigh < max < ultra（ultra 是多代理委派特档）。
+	// 与 claude --effort 的 low<medium<high<xhigh<max 完全同序、同名——所以 Task.Effort 是二者共用的
+	// "思考等级"字段（claude→--effort / codex→model_reasoning_effort）；任务级 Effort 非空时覆盖此全局值。
 	CodexReasoning string `json:"codex_reasoning,omitempty"`
 	// NoFallbackModels：这些模型的任务在 claude 冷却/红线期不降级到 codex，宁可排队等。
 	// 设计类卡（fable）质量优先——降级执行violates分层原则。runner_pref 钉定不受此限。
@@ -71,11 +74,54 @@ type Config struct {
 	// 改挂 held 升级卡交人工/设计权威裁定（防同一叶卡在实现层无限打转）。0 用默认 3。
 	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 
-	// ---- 远程执行器（SSH → 远端 codex，让 5090 等机器进编排）----
+	// ---- 远程执行器（SSH → 远端 codex，让远端主机进编排）----
 	// SSHBin 默认 "ssh"（测试可指向 mock-ssh）。RemoteHosts 键 = Task.RemoteHost（ssh 别名）。
 	// 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却、不受 claude 冷却/红线阻塞。
 	SSHBin      string                      `json:"ssh_bin,omitempty"`
 	RemoteHosts map[string]RemoteHostConfig `json:"remote_hosts,omitempty"`
+
+	// ---- 交叉验证引擎对（设计档模型撞限时以两个不同引擎顶替设计/审核/裁决/追认）----
+	// CrossProfiles 键 = profile 名（如 "opus-codex"），值为一对引擎：甲先独立出结论，乙独立出结论后
+	// 再拿甲的结论对抗式交叉查漏。引擎来源可切换——换 profile 即换模型对，无需改任何代码。
+	CrossProfiles map[string]CrossProfile `json:"cross_profiles,omitempty"`
+	// DefaultCrossProfile: `claudego cross` 未指定 -profile 时用的 profile 名。
+	DefaultCrossProfile string `json:"default_cross_profile,omitempty"`
+}
+
+// CrossEngine 描述交叉验证链中一个引擎的执行位置（模型来源可切换的落点）。
+type CrossEngine struct {
+	// Kind 执行器种类：
+	//   "claude"        本机 claude（用 Model+Effort，走本机 claude 账号额度）
+	//   "codex"         本机 codex（钉 runner=codex，用 config.codex_model/codex_reasoning=独立 GPT 额度）
+	//   "remote-claude" SSH 远端 claude（用 Host+Model，走该远端账号额度）
+	//   "remote-codex"  SSH 远端 codex（用 Host，走该远端 GPT 额度）
+	Kind string `json:"kind"`
+	// Model claude 系引擎的 --model 值（如 claude-opus-4-8）。remote-claude 必填（否则被路由到远端 codex）。
+	Model string `json:"model,omitempty"`
+	// Effort 该引擎的思考等级。claude 系→--effort，codex 系→model_reasoning_effort（二者同名同序：
+	// low<medium<high<xhigh<max）。非空即覆盖全局 codex_reasoning；空则 claude 用 CLI 默认、codex 用全局值。
+	Effort string `json:"effort,omitempty"`
+	// Host remote-* 引擎的 remote_hosts 键。
+	Host string `json:"host,omitempty"`
+	// Label 展示名（如 "opus-4.8·max"）；仅用于 CLI/日志，不影响执行。
+	Label string `json:"label,omitempty"`
+}
+
+// CrossProfile 是一对交叉验证引擎：A 先独立作答，B 独立作答后再拿 A 的结论对抗式交叉查漏。
+type CrossProfile struct {
+	A CrossEngine `json:"a"`
+	B CrossEngine `json:"b"`
+}
+
+// XFrozenEngine 是入队时钉死的引擎执行规格——把从 config 解析出的执行参数快照进卡，B/C 直接套用，
+// 不再随链在执行时从当前 config 重解析（防"入队后改 profile/codex_model 静默换引擎"的身份漂移）。
+type XFrozenEngine struct {
+	Model        string `json:"model,omitempty"`
+	Effort       string `json:"effort,omitempty"`
+	PreferRunner string `json:"prefer_runner,omitempty"`
+	RemoteHost   string `json:"remote_host,omitempty"`
+	CodexModel   string `json:"codex_model,omitempty"` // codex/远端 codex 引擎冻结的具体模型
+	Label        string `json:"label,omitempty"`
 }
 
 // RemoteHostConfig 描述一台远程执行主机（SSH 可达 + 已装 codex）。
@@ -111,6 +157,7 @@ const (
 	typeSequence     = "sequence"
 	typeCoordinate   = "coordinate"    // 分工协调：读队列+进度报告，产出任务分工并自动入队
 	typeProgressPull = "progress-pull" // 进度回收：--resume 某会话，让它输出结构化进度报告
+	typeCrossCheck   = "crosscheck"    // 交叉验证：双引擎独立作答→引擎乙拿引擎甲结论对抗式查漏（fable 顶替流）
 )
 
 func defaultConfig(claudeBin string) *Config {
@@ -133,7 +180,17 @@ func defaultConfig(claudeBin string) *Config {
 			"default": 1, "opus": 5, "sonnet": 1, "haiku": 0.2, "claude-fable-5": 10, "fable": 10,
 		},
 		NoFallbackModels: []string{"claude-fable-5", "fable"},
-		ResumePrompt:      "继续。上一条指令因为用量限额被中断，请从中断的地方接着完成当前任务；如果其实已经完成了，请直接说明完成情况。",
+		// 交叉验证默认引擎对：设计档模型撞限时，用两个不同引擎独立作答再交叉查漏顶替。
+		// 甲=本机 claude opus（最高档 max）；乙=本机 codex，具体模型/推理档来自全局 codex_model/codex_reasoning
+		// （乙的 Effort=max 覆盖为最高档）。换 profile 即换模型来源，无需改代码；档位改一个 Effort 字段即可。
+		DefaultCrossProfile: "opus-codex",
+		CrossProfiles: map[string]CrossProfile{
+			"opus-codex": {
+				A: CrossEngine{Kind: "claude", Model: "claude-opus-4-8", Effort: "max", Label: "opus·max"},
+				B: CrossEngine{Kind: "codex", Effort: "max", Label: "codex·max"},
+			},
+		},
+		ResumePrompt: "继续。上一条指令因为用量限额被中断，请从中断的地方接着完成当前任务；如果其实已经完成了，请直接说明完成情况。",
 		TypeDefaults: map[string]TypeDefaults{
 			typeReview: {
 				PermissionMode: "default",
@@ -167,6 +224,14 @@ func defaultConfig(claudeBin string) *Config {
 					"Bash(git log:*)", "Bash(git status:*)", "Bash(git diff:*)",
 				},
 			},
+			// 交叉验证卡是只读分析（读契约/源码/改动，产出结论，不写业务仓）——模型由引擎对在派卡时套上。
+			typeCrossCheck: {
+				PermissionMode: "default",
+				AllowedTools: []string{
+					"Read", "Grep", "Glob",
+					"Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(ls:*)",
+				},
+			},
 			typeSequence: {
 				PermissionMode: "acceptEdits",
 				AllowedTools: []string{
@@ -185,6 +250,7 @@ func defaultConfig(claudeBin string) *Config {
 func configPath(root string) string    { return filepath.Join(root, "config.json") }
 func tasksDir(root string) string      { return filepath.Join(root, "tasks") }
 func progressDir(root string) string   { return filepath.Join(root, "progress") }
+func crosscheckDir(root string) string { return filepath.Join(root, "crosscheck") }
 func archiveDir(root string) string    { return filepath.Join(root, "archive") }
 func logsDir(root string) string       { return filepath.Join(root, "logs") }
 func templatesDir(root string) string  { return filepath.Join(root, "templates") }
