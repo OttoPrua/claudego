@@ -79,6 +79,42 @@ Keeping project state in **files** (state.md / TASKS.md, etc.) is recommended so
 - Benefits: you never hit the session-context ceiling ("Prompt is too long" failures vanish), a limit interruption simply re-sends the current step in a fresh session (no resume prompt needed), the codex backup executor can take over **any** step (no longer limited to single-step tasks), and it's audit-friendly (all state changes live in git).
 - `plan -hold` / `assemble -hold`: the split tasks are parked (held) first; after a human review, `claudego release <id>` lets them proceed — the full loop of "split → gate → advance → review → update state".
 
+### Cross-verification (fable stand-in: two independent engines + adversarial cross-check)
+
+When a design-tier model (fable) hits its weekly limit, have two **different** engines each answer the same fable-tier task (design / review / ruling / ratification) independently, then let the second engine take the first's conclusion and adversarially hunt for gaps — two independent perspectives are far harder to lead astray with the same blind spot than one:
+
+```bash
+claudego cross -dir ~/Projects/myapp "rule on the contract semantics of a missing config key"  # default engine pair
+claudego cross -profile my-pair -dir ~/Projects/myapp "..."                                     # switch to a pair you defined in cross_profiles
+claudego cross -list                                                                            # list available pairs
+```
+
+An event-driven three-card chain — you enqueue only A; B/C chain on automatically:
+
+- **A**: engine 甲 answers independently (first-principles + adversarial self-review), producing conclusion A;
+- **B**: auto-dispatched once A finishes; engine 乙 answers independently — its **prompt is identical to A's and contains neither A's conclusion nor any pointer to it**. A's conclusion is parked in an isolation sidecar at `~/.claudego/crosscheck/<chain-id>.a` (read/written only by the orchestrator, deleted once C consumes it); it never enters B's card fields and is **not written to A's or B's log** (A's result log is redacted), and B carries only an opaque chain id unrelated to A's card id. The solo template also instructs B not to read orchestration/state directories. By default B can't reach A because it **isn't given it and is told not to look** — but this is **not a hard sandbox**: honestly, B's card carries the chain id, and the sidecar path is derived deterministically from it, so that id is effectively a pointer to the sidecar; codex `--sandbox read-only` can also read the whole disk, so a deliberately-searching executor could still find it. What this achieves is **passive-exposure minimization + a behavioral guard**; true hard isolation would require restricting the executor's read scope (which this tool does not provide);
+- **C**: auto-dispatched once B finishes; engine 乙 reads A back from the sidecar and, together with B, **adversarially cross-checks** them (what did each miss / adjudicate disagreements / blind spots only one side caught), producing a merged conclusion written to a progress report (`claudego progress -show <chain-id>`, for you to finalize).
+
+**The model source is switchable** via named engine pairs in `config.cross_profiles` (`default_cross_profile` picks the default). The default `opus-codex` = 甲 `claude opus·max` + 乙 `codex·max` (乙's concrete model comes from your `codex_model`; both at their top standard reasoning tier). Each engine's `kind` is one of `claude` / `codex` / `remote-claude` / `remote-codex`:
+
+```jsonc
+"default_cross_profile": "opus-codex",
+"cross_profiles": {
+  "opus-codex": {
+    "a": { "kind": "claude", "model": "claude-opus-4-8", "effort": "max", "label": "opus·max" },
+    "b": { "kind": "codex",  "effort": "max", "label": "codex·max" }
+  }
+}
+```
+
+- An engine's `effort` is the shared thinking level for claude and codex (claude → `--effort`, codex → `model_reasoning_effort`; same names, same order `low<medium<high<xhigh<max`), overriding the global `codex_reasoning` per task;
+- A `claude` engine requires a `model`; a `codex` engine requires `codex_bin` + `codex_model` (otherwise it would run the account/CLI default model, contradicting what the profile advertises — the command errors out, so there's no silent downgrade);
+- Cross cards are **read-only analysis** (read contracts/source/diffs, never write the repo; codex side runs `--sandbox read-only`); `-dir` may not be the claudego data root or a subdirectory of it;
+- 甲 and 乙 must share an **execution location** (both local, or both on the same `remote_hosts` host) — the three cards share one working directory, so a cross-machine pair is rejected up front;
+- **Guard rail**: during a claude cooldown, even with `codex_fallback` on, a claude-engine cross card is **never** silently diverted to codex, and a codex-pinned card **never** fails open to claude when codex is unavailable (either would collapse both engines onto one and make the verification a sham) — engine identity is frozen; the card waits for its window. If any step of the chain breaks, the parent card records it (visible in `list`), so a single-leg result never masquerades as the final verdict.
+
+**Known limitations (stated honestly)**: (1) the 甲≠乙 "different engine" check is **textual** best-effort (kind + model name); it won't catch model aliases that point to the same model — profiles are user-authored, so alias-equals-same-engine is a config responsibility; (2) enqueue-time freezing pins engine identity (kind/model/effort), **not infrastructure paths** (codex/ssh binary location, remote sandbox, etc.) — changing those in normal operation is an infra change, not identity drift; (3) the three-card chain is event-driven, not crash-atomic: a single-leg orphan from a crash exactly between "mark done" and "spawn successor" is caught and marked failed by the per-tick `reconcile` (visible), but the narrow combination of "crash + manual `clean` archiving the parent" can slip through. These are rare crash/config edges, not normal-path defects.
+
 ### Taking over existing role sessions (the review/assembly/execute sessions you maintained by hand)
 
 When a project folder already hosts a batch of long-lived role sessions, split them by role:
@@ -213,7 +249,9 @@ For full autonomy on a single task, add `-skip-permissions`, or set `skip_permis
 | `queue_budget_tokens` etc. | 0 (off) | 5-hour quota redline — see the dedicated section |
 | `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types like design-review / progress-pull are exempt and may run concurrently in the same repo) |
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the dedicated section |
-| `codex_reasoning` | "" | optional codex reasoning effort (minimal/low/medium/high/xhigh) → `-c model_reasoning_effort=…` |
+| `codex_reasoning` | "" | global codex reasoning effort (minimal/low/medium/high/xhigh/max/ultra) → `-c model_reasoning_effort=…`; a per-task effort overrides it |
+| `cross_profiles` | {opus-codex} | cross-verification engine pairs (`claudego cross`) — see the dedicated section |
+| `default_cross_profile` | "opus-codex" | engine pair used when `cross` gets no `-profile` |
 
 Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).
 

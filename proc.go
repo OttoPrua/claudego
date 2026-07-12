@@ -63,11 +63,12 @@ func runCmdRegisteredHarvest(cmd *exec.Cmd, resultInBuf func() bool) error {
 		procMu.Unlock()
 	}()
 	if resultInBuf != nil {
+		poll := remoteHarvestPoll // 读一次到局部：看门狗 goroutine 内读全局会与测试 defer 改写并发竞态（-race）
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
 			armed := false
-			t := time.NewTicker(remoteHarvestPoll)
+			t := time.NewTicker(poll)
 			defer t.Stop()
 			for {
 				select {

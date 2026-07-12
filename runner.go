@@ -43,7 +43,13 @@ var (
 	limitRe     = regexp.MustCompile(`(?i)usage limit|limit reached|out of extra usage|hit your (?:\w+ )?limit|limit will reset|out of usage credits|out of credits|/usage-credits|session limit`)
 	epochRe     = regexp.MustCompile(`\|\s*(\d{9,11})`)
 	resetTimeRe = regexp.MustCompile(`(?i)reset[s]?\s*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
-	transientRe = regexp.MustCompile(`(?i)rate.?limit|overloaded|internal server error|api error 5\d\d|econnre|network error|timed? ?out`)
+	// transientRe：可退避重试的瞬时错误。补齐 codex/上游常见网络形态——否则真错误被误判为硬失败，
+	// 烧完 attempts 直接 failed（单腿审核一挂就没了）。
+	transientRe = regexp.MustCompile(`(?i)rate.?limit|overloaded|internal server error|api error 5\d\d|econnre|network error|timed? ?out|stream (?:error|disconnect)|disconnected before|connection (?:reset|refused|closed|error)|error sending request|temporarily unavailable|502|503|read tcp|i/o timeout`)
+	// codexNoiseRe：codex exec 的横幅/配置/进度噪声行——永远不是错误，错误提取时跳过。
+	codexNoiseRe = regexp.MustCompile(`(?i)^(reading additional input|openai codex v|-{3,}$|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|user$|codex$|assistant$|tokens used|deprecated:|enable it with|hook:|see https?://|[\d,]+$)`)
+	// codexErrRe：像"错误"的行样式（供从 codex 输出里挑真错误行）。
+	codexErrRe = regexp.MustCompile(`(?i)error|failed|failure|disconnect|refused|unauthor|forbidden|denied|not found|quota|exceeded|invalid|panic|exception|unable|cannot`)
 	fencedRe    = regexp.MustCompile("(?s)```json\\s*(.*?)```")
 	// emit 容错阶梯用：任意语言标签的围栏（模型常漏写 json 标签）与输出中提到的 .json 文件名。
 	anyFencedRe = regexp.MustCompile("(?s)```[a-zA-Z]*[ \t]*\\n?(.*?)```")
@@ -110,19 +116,30 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	args := []string{"exec", "-C", t.Dir, "--sandbox", sandbox, "--skip-git-repo-check",
 		"--color", "never", "-o", outFile}
 	args = append(args, extra...)
-	if cfg.CodexModel != "" {
-		args = append(args, "-m", cfg.CodexModel)
+	// 模型：任务级冻结的 XCodexModel 优先（交叉链入队时钉死，防执行时被改/清），空才回落全局。
+	codexModel := t.XCodexModel
+	if codexModel == "" {
+		codexModel = cfg.CodexModel
 	}
-	if cfg.CodexReasoning != "" {
+	if codexModel != "" {
+		args = append(args, "-m", codexModel)
+	}
+	// 思考等级：任务级 Effort 优先（交叉验证的 codex 卡据此跑指定档，如 max），空则回落全局 codex_reasoning。
+	// codex 与 claude 的档位同名同序，故 Task.Effort 直接复用为 model_reasoning_effort。
+	if reasoning := t.Effort; reasoning != "" {
+		args = append(args, "-c", "model_reasoning_effort="+reasoning)
+	} else if cfg.CodexReasoning != "" {
 		args = append(args, "-c", "model_reasoning_effort="+cfg.CodexReasoning)
 	}
-	args = append(args, prompt)
 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cfg.CodexBin, args...)
 	setupProcGroup(cmd)
 	cmd.Dir = t.Dir
+	// prompt 走 stdin（codex exec 无 prompt 参数时读 stdin），同 invokeRemoteClaude/invokeClaude——
+	// 不再把 prompt 当 argv 参数，绕开 ARG_MAX 上限，交叉验证的合并 prompt 可注入完整甲/乙结论不截断。
+	cmd.Stdin = strings.NewReader(prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -140,7 +157,9 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 		res.IsError = true
 		res.Subtype = "codex_error"
 		if res.Result == "" {
-			res.Result = firstLine(combined)
+			// 跳过 codex 横幅噪声取真错误——否则失败一律显示 "Reading additional input from stdin"，
+			// 掩盖真因且瞬时网络错误被当硬失败。
+			res.Result = codexErrorLine(combined)
 		}
 	}
 	return res, combined, runErr
@@ -215,7 +234,7 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 	return res, combined, runErr
 }
 
-// invokeRemoteCodex 通过 SSH 在远程主机上跑 codex exec（让 5090 等机器进编排）。
+// invokeRemoteCodex 通过 SSH 在远程主机上跑 codex exec（让远端主机进编排）。
 // prompt 走 ssh stdin 灌进 codex（codex exec 无 prompt 参数时读 stdin），彻底绕开 Windows cmd 引号；
 // 结果由远端 codex 写到 -o 文件，再用 marker + type/cat 回捕到 stdout，隔开 codex 的执行日志噪声。
 // 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却。安全靠 prompt 护栏 + 人工审 diff。
@@ -237,6 +256,11 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	if sandbox == "" {
 		sandbox = "workspace-write"
 	}
+	// 只读类任务（如交叉验证卡）强制 read-only：不写业务仓，与本机 invokeCodex 的按类型选沙箱一致，
+	// 也不被主机配的 workspace-write/danger-full-access 放宽（写权限只给真正要落码的 sequence 卡）。
+	if t.Type != typeSequence {
+		sandbox = "read-only"
+	}
 	tmp := rh.TmpDir
 	if tmp == "" {
 		tmp = "."
@@ -252,11 +276,18 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	// codex -C / -o 用正斜杠（codex 自会规范化写盘）；结果打印用 shell 对应的路径分隔符。
 	remoteCmd := fmt.Sprintf(`%s exec -C "%s" --sandbox %s --skip-git-repo-check --color never -o "%s"`,
 		codexBin, t.Dir, sandbox, outFile)
-	if rh.Reasoning != "" {
+	// 思考等级：任务级 Effort 优先（交叉验证远端 codex 卡据此跑指定档），空则回落该主机 reasoning 配置。
+	if reasoning := t.Effort; reasoning != "" {
+		remoteCmd += " -c model_reasoning_effort=" + reasoning
+	} else if rh.Reasoning != "" {
 		remoteCmd += " -c model_reasoning_effort=" + rh.Reasoning
 	}
-	if cfg.CodexModel != "" {
-		remoteCmd += " -m " + cfg.CodexModel
+	codexModel := t.XCodexModel
+	if codexModel == "" {
+		codexModel = cfg.CodexModel
+	}
+	if codexModel != "" {
+		remoteCmd += " -m " + codexModel
 	}
 	remoteCmd += fmt.Sprintf(` %s echo %s %s %s "%s"`, sep, marker, sep, catCmd, printPath)
 
@@ -287,7 +318,7 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	}
 	res.IsError = true
 	res.Subtype = "remote_codex_error"
-	res.Result = firstLine(combined)
+	res.Result = codexErrorLine(combined)
 	if runErr == nil {
 		runErr = fmt.Errorf("远端 codex 无结果输出（marker 后为空）")
 	}
@@ -397,6 +428,11 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		return nil
 	}
 	t.Status = statusRunning
+	// 交叉 C 重跑（如 claudego retry）先撤下旧的终局报告：否则若这次在执行器层就失败（未进 postComplete），
+	// 上一轮的旧报告仍会被 progress -show 当成当前终局。首跑时无报告可删，无害。
+	if t.XRole == "C" {
+		_ = os.Remove(progressPath(root, t.ProgressKey))
+	}
 	remote := t.RemoteHost != ""
 	switch {
 	case remote:
@@ -435,7 +471,12 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		case resuming:
 			prompt = cfg.ResumePrompt
 		case t.Step < len(t.Prompts):
-			prompt = injectLiveContext(root, t.ID, t.Prompts[t.Step])
+			prompt = t.Prompts[t.Step]
+			// 交叉卡不走 injectLiveContext：它们的 prompt 不用 {{QUEUE}}/{{PROGRESS}}，而注入的甲/乙结论或
+			// 用户任务若含这些字面量会被二次替换污染（非确定/注入）。
+			if t.Type != typeCrossCheck {
+				prompt = injectLiveContext(root, t.ID, prompt)
+			}
 		default:
 			t.Status = statusDone
 			t.touch()
@@ -551,14 +592,29 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		t.TurnsUsed += res.NumTurns
 		t.CostUSD += res.TotalCostUSD
 		t.LastError = ""
-		if s := summarizeResult(res.Result); s != "" {
-			t.LastSummary = s
+		// 交叉验证 A 卡的结论不落可达面：不写进日志 RESULT、不写进 LastSummary(list 摘要)——
+		// 减少引擎乙从盘上被动读到甲的表面(logs/<A>.log 与 tasks/<A>.json 都是绝对路径可 Read 的)。
+		// 甲结论仅在隔离侧车(供 C 用)与 C 卡合并 prompt 里可审计。这是被动暴露最小化,非硬沙箱(见 README)。
+		if t.XRole != "A" {
+			if s := summarizeResult(res.Result); s != "" {
+				t.LastSummary = s
+			}
+			logBlock(lg, "RESULT", res.Result)
+		} else {
+			logBlock(lg, "RESULT", "[交叉A结论已隔离——不落可达日志,避免引擎乙从盘上读到甲;完整结论见隔离侧车与链汇总 C 卡]")
 		}
-		logBlock(lg, "RESULT", res.Result)
 		logSection(lg, fmt.Sprintf("步骤完成  turns=%d cost=$%.4f duration=%.0fs", res.NumTurns, res.TotalCostUSD, float64(res.DurationMS)/1000))
 
 		if t.Step >= len(t.Prompts) {
 			t.Status = statusDone
+			// 交叉 C 终局：标 done 前先定合并契约（不合规直接 failed），让**首次落盘即是终态**——
+			// 避免"done 先落盘、校验在后、failed 靠第二次保存"的崩溃窗口（reconcile 不覆盖 C）。
+			if t.XRole == "C" && !crossMergeVerdictOK(res.Result) {
+				t.Status = statusFailed
+				t.LastError = "交叉C 结论未按合并契约收尾（缺合法 verdict/confidence），不发布进度、勿采信"
+				_ = os.Remove(progressPath(root, t.ProgressKey)) // 清可能残留的陈旧报告，防冒充终局
+				logBlock(lg, "CROSS", t.LastError)
+			}
 			t.touch()
 			if err := saveTask(root, t); err != nil {
 				return err
@@ -625,10 +681,27 @@ func runReviewSync(t *Task, lg *os.File) error {
 
 // postComplete 处理任务链：进度报告落盘；装配/协调任务产出的新任务入队；review_after 自动入队设计审核。
 func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
+	// C 存在即意味 B→C 已成，甲结论侧车使命完成——清理（兜住 B→C 在删侧车前崩溃的残留）。
+	if t.XRole == "C" {
+		_ = os.Remove(crossPeerPath(root, t.XKey))
+	}
+	// 交叉 C 终局：先验证合并契约，不合规就**不发布 progress**（否则伪终局会被 progress -show 当有效终局
+	// 展示，"发布在前、验证在后"会漏），清陈旧报告、置 failed 收尾。
+	if t.XRole == "C" && !crossMergeVerdictOK(res.Result) {
+		t.Status = statusFailed
+		t.LastError = "交叉C 结论未按合并契约收尾（缺合法 verdict/confidence），不发布进度、勿采信为有效终局"
+		_ = os.Remove(progressPath(root, t.ProgressKey)) // 清可能残留的旧报告，防 progress -show 冒充终局
+		logBlock(lg, "CROSS", t.LastError)
+		return
+	}
 	if t.EmitProgress {
 		if key, err := saveProgressFromResult(root, t, res.Result); err != nil {
 			t.LastError = "进度报告落盘失败: " + err.Error()
 			logBlock(lg, "PROGRESS", t.LastError)
+			if t.XRole == "C" {
+				t.Status = statusFailed                          // C 的终局报告没落盘=终局缺失，别显示成功
+				_ = os.Remove(progressPath(root, t.ProgressKey)) // 清陈旧报告，别留旧的冒充当前终局
+			}
 		} else {
 			logBlock(lg, "PROGRESS", "进度报告已写入: "+progressPath(root, key))
 		}
@@ -694,6 +767,32 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 	if t.Type == typeReview {
 		handleReviewVerdict(root, cfg, t, res.Result, lg)
 	}
+	// 交叉验证链：A 完成 → 派独立引擎乙的 B 卡（不注入 A）；B 完成 → 派引擎乙交叉查漏的 C 卡（注入 A+B）。
+	// C 是终点，交编排者综合（C 的 json 结论经 EmitProgress 落进度报告）。
+	if t.XRole == "A" || t.XRole == "B" {
+		handleCrossStage(root, cfg, t, res, lg)
+	}
+}
+
+// crossMergeVerdictOK 判断 C 的输出是否按合并契约收尾：末尾有 json 块，含非空 verdict + 枚举 confidence。
+// confidence 枚举校验拦住 {"verdict":"banana"} 这类无结构 verdict 的伪合规终局（缺 confidence 即判不合规）。
+func crossMergeVerdictOK(result string) bool {
+	raw := lastFencedJSON(result)
+	if raw == "" {
+		return false
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(raw), &m) != nil {
+		return false
+	}
+	if v, _ := m["verdict"].(string); strings.TrimSpace(v) == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(rptStr(m["confidence"]))) {
+	case "high", "medium", "low":
+		return true
+	}
+	return false
 }
 
 type emitTask struct {
@@ -1006,6 +1105,321 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	logBlock(lg, "FIXLOOP", fmt.Sprintf("verdict=%s → 已自动入队第 %d 轮修复卡 %s（%dP0+%dP1，effort=%s）", v.Verdict, round, nt.ID, len(v.P0), len(v.P1), nt.Effort))
 }
 
+var crossTitleRe = regexp.MustCompile(`^交叉[^\[]*\[[^\]]*\]:\s*`)
+
+// crossBase 剥掉交叉卡标题的「交叉X[profile]: 」前缀，得到谱系根标题。
+func crossBase(title string) string { return crossTitleRe.ReplaceAllString(title, "") }
+
+// crossPeerPath 是甲结论的隔离侧车路径：<root>/crosscheck/<XKey>.a。甲结论不进任何交叉卡的字段/日志，
+// 仅编排进程读写、C 用完即删、0600 最小权限。**诚实边界**：B 卡里带着 XKey，而侧车路径由 XKey 确定性
+// 推导——严格说 B 握有指向侧车的键。所以这**不是硬沙箱**（codex read-only 读全盘，刻意搜索仍可能触达）；
+// 它做到的是被动暴露最小化 + 行为护栏（solo 明令别找），默认下 B 拿不到甲是因为没被给、被明令别找。
+func crossPeerPath(root, xkey string) string { return filepath.Join(crosscheckDir(root), xkey+".a") }
+
+func writeCrossPeer(root, xkey, data string) error {
+	if err := os.MkdirAll(crosscheckDir(root), 0o700); err != nil {
+		return err
+	}
+	// 0600 原子写：敏感中间产物给最小 OS 权限（同用户不构成硬隔离，但不给其余用户/进程可读）。
+	p := crossPeerPath(root, xkey)
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(data), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+// applyCrossEngine 把交叉验证引擎的执行位置写进卡——这是"模型来源可切换"的落点：
+// 换 profile.A/B 的 Kind/Model/Host 即换引擎，卡的结构与链路不变。先清引擎相关字段防串味。
+var validXEfforts = map[string]bool{"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true, "ultra": true}
+
+// crossEngineIdentity 给引擎算一个规范身份串（执行器+具体模型）；甲乙身份相同=同引擎=单引擎自审，须拒。
+// 这是**文本级 best-effort**：拦得住"两 codex / 同 model claude"这类直白的同引擎；但拦不了模型别名
+// （如 "opus" 与 "claude-opus-4-8" 实为同一模型）——无模型规范化表无法穷尽，profile 是用户自写、别名同引擎
+// 属用户配置责任。
+func crossEngineIdentity(eng CrossEngine, cfg *Config) string {
+	switch eng.Kind {
+	case "claude":
+		return "claude|" + eng.Model
+	case "codex":
+		return "codex|" + cfg.CodexModel
+	case "remote-claude":
+		return "remote-claude|" + eng.Host + "|" + eng.Model
+	case "remote-codex":
+		return "remote-codex|" + eng.Host + "|" + cfg.CodexModel
+	}
+	return eng.Kind
+}
+
+// freezeCrossEngine 把引擎解析成冻结执行规格（同时做 applyCrossEngine 的全部校验）。
+func freezeCrossEngine(eng CrossEngine, cfg *Config) (*XFrozenEngine, error) {
+	tmp := &Task{Prompts: []string{"x"}}
+	if err := applyCrossEngine(tmp, eng, cfg); err != nil {
+		return nil, err
+	}
+	f := &XFrozenEngine{Model: tmp.Model, Effort: tmp.Effort, PreferRunner: tmp.PreferRunner, RemoteHost: tmp.RemoteHost, Label: crossEngineLabel(eng)}
+	// 冻结空 effort 的 reasoning 回落——但必须冻结**执行时真正会用的那个源**：本机 codex 回落全局
+	// codex_reasoning，远端 codex 回落该主机的 reasoning。冻错源会在正常路径就跑错档位。
+	switch eng.Kind {
+	case "codex":
+		f.CodexModel = cfg.CodexModel
+		if f.Effort == "" {
+			f.Effort = cfg.CodexReasoning
+		}
+	case "remote-codex":
+		f.CodexModel = cfg.CodexModel
+		if f.Effort == "" {
+			if rh, ok := cfg.RemoteHosts[eng.Host]; ok {
+				f.Effort = rh.Reasoning // invokeRemoteCodex 的既有回落源是 host 的 reasoning，非全局
+			}
+		}
+	}
+	return f, nil
+}
+
+// applyFrozenEngine 把冻结规格套到卡（B/C 用它，不再从 config 重解析——身份冻结）。
+func applyFrozenEngine(t *Task, f *XFrozenEngine) {
+	t.Model, t.Effort, t.PreferRunner, t.RemoteHost = f.Model, f.Effort, f.PreferRunner, f.RemoteHost
+	t.XCodexModel = f.CodexModel
+}
+
+func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
+	if eng.Effort != "" && !validXEfforts[eng.Effort] {
+		return fmt.Errorf("交叉引擎 effort %q 非法（minimal/low/medium/high/xhigh/max/ultra）", eng.Effort)
+	}
+	t.Model, t.Effort, t.PreferRunner, t.RemoteHost = "", "", "", ""
+	switch eng.Kind {
+	case "claude":
+		// 本机 claude：默认执行器，走本机 claude 账号额度（如 opus-4.8 max）。
+		// Model 必填：空则 invokeClaude 省略 --model、跑账号默认模型（典型 Max 部署=Sonnet），
+		// 而日志/Label 仍宣称 opus——验证质量被静默降级。镜像 remote-claude 的守卫。
+		if eng.Model == "" {
+			return fmt.Errorf("claude 交叉引擎必须显式指定 model，否则跑成账号默认模型、验证质量静默降级")
+		}
+		t.Model = eng.Model
+		t.Effort = eng.Effort
+	case "codex":
+		// 本机 codex：钉 runner=codex，用独立 GPT 额度；模型来自全局 codex_model，思考档取 eng.Effort
+		// （空则回落全局 codex_reasoning）——invokeCodex 已优先 t.Effort，故交叉验证的 codex 卡可跑在 max。
+		if cfg.CodexBin == "" {
+			return fmt.Errorf("codex 引擎需 config.codex_bin")
+		}
+		// 必须显式钉模型：否则跑成 codex 内置默认模型，与 profile 宣称不符，验证质量被静默降级。
+		if cfg.CodexModel == "" {
+			return fmt.Errorf("codex 交叉引擎需 config.codex_model 显式指定，否则会跑成 codex 默认模型")
+		}
+		// codex 的模型由全局 codex_model 决定；profile 里再写 model 是零效 no-op（会误导使用者以为设了）。
+		if eng.Model != "" {
+			return fmt.Errorf("codex 交叉引擎的 model 由 config.codex_model 决定，请从 profile 删掉 model 字段（此处写它会被忽略）")
+		}
+		t.PreferRunner = "codex"
+		t.Effort = eng.Effort
+	case "remote-claude":
+		// SSH 远端 claude：Model 必填，否则 remoteUsesClaude 判 false 会被路由到远端 codex。
+		if _, ok := cfg.RemoteHosts[eng.Host]; !ok {
+			return fmt.Errorf("remote_hosts 未配置主机 %q", eng.Host)
+		}
+		if eng.Model == "" {
+			return fmt.Errorf("remote-claude 引擎必须指定 model（否则会被路由到远端 codex）")
+		}
+		t.RemoteHost = eng.Host
+		t.Model = eng.Model
+		t.Effort = eng.Effort
+	case "remote-codex":
+		// SSH 远端 codex：无模型 → remoteUsesClaude 判 false → 走远端 codex，用该远端 GPT 额度。
+		// 思考档同样取 eng.Effort（空则回落该主机的 reasoning 配置）。远端 codex 亦用全局 codex_model。
+		if _, ok := cfg.RemoteHosts[eng.Host]; !ok {
+			return fmt.Errorf("remote_hosts 未配置主机 %q", eng.Host)
+		}
+		if cfg.CodexModel == "" {
+			return fmt.Errorf("remote-codex 交叉引擎需 config.codex_model 显式指定，否则会跑成 codex 默认模型")
+		}
+		if eng.Model != "" {
+			return fmt.Errorf("remote-codex 交叉引擎的 model 由 config.codex_model 决定，请从 profile 删掉 model 字段")
+		}
+		t.RemoteHost = eng.Host
+		t.Effort = eng.Effort
+	default:
+		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/remote-claude/remote-codex）", eng.Kind)
+	}
+	// codex/远端引擎要求 codexEligible（单步无会话）——交叉卡都是单步，正常满足；防御性兜底。
+	if (t.PreferRunner == "codex" || t.RemoteHost != "") && !codexEligible(t) {
+		return fmt.Errorf("codex/远端引擎要求单步无会话")
+	}
+	return nil
+}
+
+// handleCrossStage 推进交叉验证链：
+//   A 完成 → 甲结论落隔离侧车（不进任何卡字段）→ 派引擎乙独立作答的 B 卡（prompt 与 A 相同、不含 A、无 A 指针）；
+//   B 完成 → 从侧车取甲结论 → 派引擎乙交叉查漏的 C 卡（合并模板注入完整甲+乙结论）→ 删侧车。
+// 链任一步断裂把母卡置 failed（list 对 failed 显示 LastError 且不折叠，故断裂可见），绝不让单腿结果冒充成功。
+func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
+	// breakChain 把母卡从 done 改判为 failed + 写断裂原因。runTask 在 postComplete 后 saveTask 落盘；
+	// 置 failed 而非仅写 LastError 是因为 list/cmdList 只对 failed 卡渲染 LastError，done 卡从不显示它
+	// （否则断裂母卡与成功卡视觉全等——round-1 的"已可见"是空头承诺）。
+	breakChain := func(reason string) {
+		t.Status = statusFailed
+		t.LastError = "交叉链断裂: " + reason
+		_ = os.Remove(crossPeerPath(root, t.XKey)) // 断裂时清理侧车,不留甲结论长期残驻
+		logBlock(lg, "CROSS", "链中断（母卡置 failed 留痕）: "+reason)
+	}
+	// 乙引擎用**冻结**规格（入队时钉死），不从当前 config 重解析——防身份漂移。
+	if t.XEngineB == nil {
+		breakChain("缺冻结的乙引擎规格 XEngineB（旧卡/数据损坏）")
+		return
+	}
+	base := crossBase(t.Title)
+	label := t.XEngineB.Label
+	if label == "" {
+		label = "引擎乙"
+	}
+	switch t.XRole {
+	case "A":
+		// 甲结论落隔离侧车——不进 B 的任何字段/prompt/日志（被动暴露最小化，非硬沙箱）。
+		if err := writeCrossPeer(root, t.XKey, resultText(res)); err != nil {
+			breakChain("甲结论侧车落盘失败: " + err.Error())
+			return
+		}
+		// B 用与 A 完全相同的独立作答 prompt（公平 + 独立），套**冻结**的乙引擎。
+		b := newTask(root, cfg, typeCrossCheck, "交叉B["+t.XProfile+"]: "+base, t.Dir, []string{t.Prompts[0]}, t.Priority)
+		b.XRole = "B"
+		b.XKey = t.XKey
+		b.XProfile = t.XProfile
+		b.XTask = t.XTask
+		b.XEngineB = t.XEngineB       // 冻结规格随链传递
+		applyFrozenEngine(b, t.XEngineB)
+		if err := saveTask(root, b); err != nil {
+			breakChain("B 卡落盘失败: " + err.Error())
+			return
+		}
+		logBlock(lg, "CROSS", fmt.Sprintf("引擎甲完成 → 已派独立引擎乙 B 卡 %s（%s，不含甲结论、无 A 指针）", b.ID, label))
+	case "B":
+		tpl, err := loadTemplate(root, "crosscheck-merge")
+		if err != nil {
+			breakChain("crosscheck-merge 模板不可得: " + err.Error())
+			return
+		}
+		peer, err := os.ReadFile(crossPeerPath(root, t.XKey))
+		if err != nil {
+			breakChain("甲结论侧车不可得: " + err.Error())
+			return
+		}
+		// 全量注入甲+乙结论（stdin 传 prompt，无 argv 上限，不截断）。
+		prompt := renderTemplate(tpl, map[string]string{
+			"TASK": t.XTask,
+			"A":    strings.TrimSpace(string(peer)),
+			"B":    strings.TrimSpace(resultText(res)),
+		})
+		c := newTask(root, cfg, typeCrossCheck, "交叉C汇总["+t.XProfile+"]: "+base, t.Dir, []string{prompt}, t.Priority)
+		c.XRole = "C"
+		c.XKey = t.XKey
+		c.XProfile = t.XProfile
+		c.XEngineB = t.XEngineB
+		c.EmitProgress = true // C 的 json 最终结论落进度报告，键=XKey，供 progress -show 取回
+		c.ProgressKey = t.XKey
+		applyFrozenEngine(c, t.XEngineB)
+		if err := saveTask(root, c); err != nil {
+			breakChain("C 卡落盘失败: " + err.Error())
+			return
+		}
+		_ = os.Remove(crossPeerPath(root, t.XKey)) // C 已烘入甲+乙全文，侧车使命完成，清理
+		logBlock(lg, "CROSS", fmt.Sprintf("引擎乙完成 → 已派交叉查漏 C 卡 %s（%s，注入甲+乙完整结论）", c.ID, label))
+	}
+}
+
+// reconcileCrossChains 崩溃对账：done 的交叉 A/B 卡若无后继卡（同 XKey 的 B/C），是进程在"标 done"与
+// "派后继卡"之间崩溃遗留的单腿孤儿——正常窗口内后继已在同一 runTask 落盘，故一个"已结算(不在 active)+done+
+// 无后继"的卡必是崩溃孤儿。置 failed 留痕并清侧车，不让单腿结果静默冒充成功。active 守卫排除仍在跑
+// （runTask 可能正处于 postComplete 派后继的微秒窗口）的卡，避免误判。
+func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
+	has := map[string]map[string]bool{} // xkey -> {role: present}
+	for _, t := range tasks {
+		if t.XKey != "" && t.XRole != "" {
+			if has[t.XKey] == nil {
+				has[t.XKey] = map[string]bool{}
+			}
+			has[t.XKey][t.XRole] = true
+		}
+	}
+	var archived map[string]map[string]bool // 惰性加载：仅在有候选孤儿时才扫 archive/
+	for _, t := range tasks {
+		if active[t.ID] || t.Status != statusDone || (t.XRole != "A" && t.XRole != "B") {
+			continue
+		}
+		next := "C"
+		if t.XRole == "A" {
+			next = "B"
+		}
+		if has[t.XKey][next] {
+			continue // 后继在 tasks/，链正常
+		}
+		// 后继不在 tasks/：可能已完成并归档（clean/cancel），查 archive/ 再定夺，避免误判正常完成的链。
+		if archived == nil {
+			archived = crossRolesInArchive(root)
+		}
+		if archived[t.XKey][next] {
+			continue
+		}
+		t.Status = statusFailed
+		t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, next)
+		_ = os.Remove(crossPeerPath(root, t.XKey))
+		_ = saveTask(root, t)
+	}
+}
+
+// crossRolesInArchive 扫 archive/ 里交叉卡的 XKey→role（供 reconcile 判"后继是否已完成归档"）。
+func crossRolesInArchive(root string) map[string]map[string]bool {
+	m := map[string]map[string]bool{}
+	entries, err := os.ReadDir(archiveDir(root))
+	if err != nil {
+		return m
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(archiveDir(root), e.Name()))
+		if err != nil {
+			continue
+		}
+		var t Task
+		if json.Unmarshal(data, &t) != nil || t.XKey == "" || t.XRole == "" {
+			continue
+		}
+		if m[t.XKey] == nil {
+			m[t.XKey] = map[string]bool{}
+		}
+		m[t.XKey][t.XRole] = true
+	}
+	return m
+}
+
+// crossEngineLoc 返回引擎的执行位置："local"（本机 claude/codex）或 "remote:<host>"。
+// 交叉链的 A/B/C 共用一个工作目录（handleCrossStage 复制 A.Dir），故一对引擎必须同位置——
+// 否则 B/C 拿着 A 的目录被派到错误的机器（本机路径派去远端 cd 失败，或远端路径被当本地目录）。
+func crossEngineLoc(eng CrossEngine) string {
+	if eng.Kind == "remote-claude" || eng.Kind == "remote-codex" {
+		return "remote:" + eng.Host
+	}
+	return "local"
+}
+
+// crossEngineLabel 给引擎生成展示名：优先 Label，否则据 kind/model/host 拼一个。
+func crossEngineLabel(eng CrossEngine) string {
+	if eng.Label != "" {
+		return eng.Label
+	}
+	switch eng.Kind {
+	case "claude":
+		return orDash(eng.Model) + "·" + orDash(eng.Effort)
+	case "codex":
+		return "codex"
+	case "remote-claude", "remote-codex":
+		return eng.Kind + "@" + eng.Host
+	}
+	return eng.Kind
+}
+
 func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]string, error) {
 	tasks, err := extractEmitTasks(result, parent.Dir)
 	if err != nil {
@@ -1121,6 +1535,36 @@ func firstLine(s string) string {
 		}
 	}
 	return ""
+}
+
+// codexErrorLine 从 codex 的 stdout+stderr 里提取**真正的失败原因**，跳过横幅/配置/进度噪声。
+// codex exec 的第一行永远是横幅 "Reading additional input from stdin..."、随后是 OpenAI Codex 版本/
+// workdir/model/... 配置块——firstLine 恰好取到横幅，掩盖真因（网络/限额/流断在末尾），还让 transientRe
+// 匹配不到、把可退避的瞬时错误当硬失败烧 attempts（单腿审核一挂就没了）。优先返回命中错误/瞬时样式的
+// 行，否则返回最后一条非噪声行，都没有才回退 firstLine。
+func codexErrorLine(combined string) string {
+	last := ""
+	for _, l := range strings.Split(combined, "\n") {
+		t := strings.TrimSpace(l)
+		if t == "" || codexNoiseRe.MatchString(t) {
+			continue
+		}
+		last = t
+		if transientRe.MatchString(t) || codexErrRe.MatchString(t) {
+			if len(t) > 300 {
+				return t[:300]
+			}
+			return t
+		}
+	}
+	if last != "" {
+		if len(last) > 300 {
+			return last[:300]
+		}
+		return last
+	}
+	// 全是横幅/配置噪声、无任何真错误行——回退 firstLine 只会取到横幅，故给通用说明。
+	return "codex 无有效错误输出（仅横幅/配置，可能超时/被截断/进程被杀）"
 }
 
 // summarizeResult 取一步最终输出里第一条实质内容行，作为 list 看板“最新进度概述”的回落来源。
